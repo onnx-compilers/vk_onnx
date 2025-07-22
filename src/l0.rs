@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 use protobuf::Enum;
 
@@ -9,17 +10,19 @@ use crate::protos::onnx::{self, TensorShapeProto, ValueInfoProto, type_proto};
 
 #[derive(Clone, Debug)]
 pub struct IR {
-    pub instructions: Vec<Instruction>,
+    pub operations: Vec<Operation>,
+    pub input_names: Vec<String>,
     pub inputs: Vec<Input>,
+    pub output_names: Vec<String>,
     pub outputs: Vec<Output>,
 }
 
-#[derive(Clone, Debug)]
-pub enum Instruction {
-    BinOp(Ty, BinOp<Value>),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Operation {
+    BinOp(BinOp<Value>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     Parameter(Parameter),
     Temporary(Temporary),
@@ -32,35 +35,25 @@ pub struct Temporary(pub usize);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Input {
-    pub name: String,
     pub ty: Ty,
-    pub shape: Vec<usize>,
-    pub batch: Option<Batch>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Output {
-    pub name: String,
-    pub value: Value,
+    pub shape: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Batch {
-    First,
-    Last,
+pub struct Output {
+    pub value: Value,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOpKind {
     Add,
 }
 
-#[derive(Clone, Debug)]
-pub struct BinOp<R> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinOp<R: PartialEq + Eq> {
     pub kind: BinOpKind,
     pub lhs: R,
     pub rhs: R,
-    pub shapes: BinOpShapes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,21 +63,14 @@ pub enum Ty {
     U32,
 }
 
-#[derive(Clone, Debug)]
-pub enum BinOpShapes {
-    SS,                                  // scalar-scalar
-    TS(Vec<usize>),                      // tensor-scalar
-    TTExact(Vec<usize>),                 // tensor-tensor with same shape
-    TTBroadcast(Vec<usize>, Vec<usize>), // tensor-tensor with broadcast
-}
-
 #[derive(Default)]
 struct IRBuilder<'a> {
     model: &'a onnx::ModelProto,
-    instructions: Vec<Instruction>,
+    operations: Vec<Operation>,
     inputs: Vec<Input>,
     outputs: Vec<Output>,
     input_map: HashMap<&'a str, usize>,
+    output_map: HashMap<&'a str, Temporary>,
     tmp_count: usize,
 }
 
@@ -95,10 +81,47 @@ pub enum IRBuildError {
     InvalidElementType(usize),
     ShapelessTensor(usize),
     MissingName(usize),
-    MissingDimension { index: usize, dimension: usize },
+    MissingOpName(usize),
+    WrongInputCount { index: usize, expected: usize },
+    WrongOutputCount { index: usize, expected: usize },
+    UnknownInput { index: usize, nth: usize },
+    UnknownOutput(usize),
 }
 
 type Result<V> = core::result::Result<V, IRBuildError>;
+
+impl From<usize> for Parameter {
+    fn from(idx: usize) -> Self {
+        Self(idx)
+    }
+}
+
+impl From<usize> for Temporary {
+    fn from(idx: usize) -> Self {
+        Self(idx)
+    }
+}
+
+impl From<Parameter> for Value {
+    fn from(p: Parameter) -> Self {
+        Self::Parameter(p)
+    }
+}
+
+impl From<Temporary> for Value {
+    fn from(t: Temporary) -> Self {
+        Self::Temporary(t)
+    }
+}
+
+impl Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Parameter(Parameter(i)) => write!(f, "Parameter({})", i),
+            Value::Temporary(Temporary(i)) => write!(f, "Temporary({})", i),
+        }
+    }
+}
 
 impl<'a> IRBuilder<'a> {
     fn new(model: &'a onnx::ModelProto) -> Self {
@@ -114,11 +137,14 @@ impl<'a> IRBuilder<'a> {
 
     fn build(mut self) -> Result<IR> {
         self.build_inputs()?;
-        self.build_instructions()?;
+        self.build_operations()?;
+        self.build_outputs()?;
         Ok(IR {
-            instructions: self.instructions,
-            inputs: self.inputs.to_vec(),
+            operations: self.operations,
+            inputs: self.inputs,
+            input_names: self.input_map.keys().map(|k| k.to_string()).collect(),
             outputs: self.outputs,
+            output_names: self.output_map.keys().map(|k| k.to_string()).collect(),
         })
     }
 
@@ -144,34 +170,106 @@ impl<'a> IRBuilder<'a> {
                 .map(parse_ty)
                 .ok_or(IRBuildError::InvalidElementType(i))?;
 
-            let (dims, batch_config) = tensor_ty
+            let dims = tensor_ty
                 .shape
                 .as_ref()
                 .ok_or(IRBuildError::ShapelessTensor(i))
-                .and_then(|shape_proto| parse_shape(i, shape_proto))?;
+                .and_then(|shape_proto| parse_shape(shape_proto))?;
 
             self.input_map.insert(name.as_str(), i);
-
             self.inputs.push(Input {
-                name: name.clone(),
                 ty: elem_ty,
                 shape: dims,
-                batch: batch_config,
             });
         }
 
         Ok(())
     }
 
-    fn build_instructions(&mut self) -> Result<()> {
+    fn build_operations(&mut self) -> Result<()> {
+        for (i, node) in self.model.graph.node.iter().enumerate() {
+            let op_type = node
+                .op_type
+                .as_ref()
+                .ok_or(IRBuildError::MissingOpName(i))?;
+            let tmp = self.make_temporary();
+            let (op, output_name) = match op_type.as_str() {
+                "Add" => {
+                    if node.input.len() != 2 {
+                        return Err(IRBuildError::WrongInputCount {
+                            index: i,
+                            expected: 2,
+                        });
+                    }
+                    if node.output.len() != 1 {
+                        return Err(IRBuildError::WrongOutputCount {
+                            index: i,
+                            expected: 1,
+                        });
+                    }
+                    let lhs_name = node.input[0].as_str();
+                    let rhs_name = node.input[1].as_str();
+                    let lhs = self.find_operand(lhs_name).ok_or_else(|| {
+                        IRBuildError::UnknownInput { index: i, nth: 0 }
+                    })?;
+                    let rhs = self.find_operand(rhs_name).ok_or_else(|| {
+                        IRBuildError::UnknownInput { index: i, nth: 1 }
+                    })?;
+                    let output_name = node.output[0].as_str();
+                    (
+                        Operation::BinOp(BinOp {
+                            kind: BinOpKind::Add,
+                            lhs,
+                            rhs,
+                        }),
+                        output_name,
+                    )
+                }
+                _ => todo!(),
+            };
+            self.operations.push(op);
+            self.output_map.insert(output_name, tmp);
+        }
+
         Ok(())
+    }
+
+    fn build_outputs(&mut self) -> Result<()> {
+        for (i, output) in self.model.graph.output.iter().enumerate() {
+            let name =
+                output.name.as_ref().ok_or(IRBuildError::MissingName(i))?;
+            let value = self
+                .find_operand(name.as_str())
+                .ok_or_else(|| IRBuildError::UnknownOutput(i))?;
+            self.outputs.push(Output { value });
+        }
+        Ok(())
+    }
+
+    fn make_temporary(&mut self) -> Temporary {
+        let idx = self.tmp_count;
+        self.tmp_count += 1;
+        Temporary(idx)
+    }
+
+    fn find_operand(&self, name: &str) -> Option<Value> {
+        self.input_map
+            .get(name)
+            .copied()
+            .map(|idx| Value::Parameter(idx.into()))
+            .or_else(|| {
+                self.output_map
+                    .get(name)
+                    .copied()
+                    .map(|idx| Value::Temporary(idx.into()))
+            })
     }
 }
 
 impl TranslateFrom<onnx::ModelProto> for IR {
     type Error = IRBuildError;
-    fn translate_from(model: &onnx::ModelProto) -> Result<IR> {
-        let builder = IRBuilder::new(model);
+    fn translate_from(model: onnx::ModelProto) -> Result<IR> {
+        let builder = IRBuilder::new(&model);
         builder.build()
     }
 }
@@ -185,49 +283,24 @@ fn parse_ty(ty: DataType) -> Ty {
     }
 }
 
-fn parse_shape(
-    idx: usize,
-    shape: &TensorShapeProto,
-) -> Result<(Vec<usize>, Option<Batch>)> {
+fn parse_shape(shape: &TensorShapeProto) -> Result<Vec<Option<usize>>> {
     let TensorShapeProto { dim: raw_dims, .. } = shape;
-    let batch = if raw_dims.len() > 1 {
-        let Dimension { value: first, .. } = &raw_dims[0];
-        let Dimension { value: last, .. } = &raw_dims[raw_dims.len() - 1];
-        first
-            .is_none()
-            .then_some(Batch::First)
-            .or_else(|| last.is_none().then_some(Batch::Last))
-    } else {
-        None
-    };
-
-    let raw_dims = batch.as_ref().map_or_else(
-        || &raw_dims[..],
-        |batch| match batch {
-            Batch::First => &raw_dims[1..],
-            Batch::Last => &raw_dims[..raw_dims.len() - 1],
-        },
-    );
-
     let mut dims = Vec::with_capacity(raw_dims.len());
-    for (j, raw_dim) in raw_dims.iter().enumerate() {
+    for raw_dim in raw_dims.iter() {
         let Dimension { value, .. } = raw_dim;
         let value = value
             .as_ref()
-            .ok_or(IRBuildError::MissingDimension {
-                index: idx,
-                dimension: j,
-            })
             .and_then(|v| match v {
-                &dimension::Value::DimValue(v) => Ok(v),
+                &dimension::Value::DimValue(v) => Some(v),
                 dimension::Value::DimParam(_) => {
                     todo!("Named parameter dimensions")
                 }
-            })?;
-        dims.push(value as usize);
+            })
+            .map(|v| v as usize);
+        dims.push(value);
     }
 
-    Ok((dims, batch))
+    Ok(dims)
 }
 
 #[cfg(test)]
@@ -239,32 +312,59 @@ mod tests {
 
     use crate::protos::onnx::ModelProto;
 
+    fn project_path() -> Box<Path> {
+        Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .into()
+    }
+
     #[test]
     fn test_translate_simple_add() {
-        let models_dir = Path::new(file!())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("test_models");
+        let models_dir = project_path().join("test_models");
 
         let graph_path = models_dir.join("simple_add.onnx");
         let bytes = std::fs::read(graph_path).unwrap();
         let model = ModelProto::parse_from_bytes(&bytes[..]).unwrap();
-        let ir = IR::translate_from(&model).unwrap();
+        let ir = IR::translate_from(model).unwrap();
         assert_eq!(ir.inputs.len(), 2);
-        assert_eq!(ir.inputs[0], Input {
-            name: "X".to_string(),
-            ty: Ty::F32,
-            shape: vec![3, 2],
-            batch: None
-        });
-        assert_eq!(ir.inputs[1], Input {
-            name: "Y".to_string(),
-            ty: Ty::F32,
-            shape: vec![3, 2],
-            batch: None
-        });
+        assert_eq!(ir.input_names, vec!["X", "Y"]);
+        assert_eq!(
+            ir.inputs[0],
+            Input {
+                ty: Ty::F32,
+                shape: [3, 2].into_iter().map(Some).collect(),
+            }
+        );
+        assert_eq!(
+            ir.inputs[1],
+            Input {
+                ty: Ty::F32,
+                shape: [3, 2].into_iter().map(Some).collect(),
+            }
+        );
+
+        assert_eq!(ir.outputs.len(), 1);
+        assert_eq!(ir.output_names, vec!["Z"]);
+        assert_eq!(
+            ir.outputs[0],
+            Output {
+                value: Value::Temporary(Temporary(0)),
+            }
+        );
+
+        assert_eq!(ir.operations.len(), 1);
+        assert_eq!(
+            ir.operations[0],
+            Operation::BinOp(BinOp {
+                kind: BinOpKind::Add,
+                lhs: Value::Parameter(Parameter(0)),
+                rhs: Value::Parameter(Parameter(1)),
+            })
+        );
+
         eprintln!("{:#?}", ir);
     }
 }
