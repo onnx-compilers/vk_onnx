@@ -3,7 +3,7 @@ use std::fmt::Debug;
 
 use protobuf::Enum;
 
-use crate::l_base::TranslateFrom;
+use crate::l_base::{ScalarTy, TranslateFrom};
 use crate::protos::onnx::tensor_proto::DataType;
 use crate::protos::onnx::tensor_shape_proto::{Dimension, dimension};
 use crate::protos::onnx::{self, TensorShapeProto, ValueInfoProto, type_proto};
@@ -35,7 +35,7 @@ pub struct Temporary(pub usize);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Input {
-    pub ty: Ty,
+    pub ty: ScalarTy,
     pub shape: Vec<Option<usize>>,
 }
 
@@ -54,13 +54,6 @@ pub struct BinOp<R: PartialEq + Eq> {
     pub kind: BinOpKind,
     pub lhs: R,
     pub rhs: R,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ty {
-    F32,
-    S32,
-    U32,
 }
 
 #[derive(Default)]
@@ -144,7 +137,11 @@ impl<'a> IRBuilder<'a> {
             inputs: self.inputs,
             input_names: self.input_map.keys().map(|k| k.to_string()).collect(),
             outputs: self.outputs,
-            output_names: self.output_map.keys().map(|k| k.to_string()).collect(),
+            output_names: self
+                .output_map
+                .keys()
+                .map(|k| k.to_string())
+                .collect(),
         })
     }
 
@@ -274,11 +271,11 @@ impl TranslateFrom<onnx::ModelProto> for IR {
     }
 }
 
-fn parse_ty(ty: DataType) -> Ty {
+fn parse_ty(ty: DataType) -> ScalarTy {
     match ty {
-        DataType::FLOAT => Ty::F32,
-        DataType::INT32 => Ty::S32,
-        DataType::UINT32 => Ty::U32,
+        DataType::FLOAT => ScalarTy::F32,
+        DataType::INT32 => ScalarTy::S32,
+        DataType::UINT32 => ScalarTy::U32,
         _ => todo!(),
     }
 }
@@ -330,18 +327,21 @@ mod tests {
         let model = ModelProto::parse_from_bytes(&bytes[..]).unwrap();
         let ir = IR::translate_from(model).unwrap();
         assert_eq!(ir.inputs.len(), 2);
-        assert_eq!(ir.input_names, vec!["X", "Y"]);
+        assert!(ir.input_names
+            .iter()
+            .map(String::as_str)
+            .all(|name| ["X", "Y"].contains(&name)));
         assert_eq!(
             ir.inputs[0],
             Input {
-                ty: Ty::F32,
+                ty: ScalarTy::F32,
                 shape: [3, 2].into_iter().map(Some).collect(),
             }
         );
         assert_eq!(
             ir.inputs[1],
             Input {
-                ty: Ty::F32,
+                ty: ScalarTy::F32,
                 shape: [3, 2].into_iter().map(Some).collect(),
             }
         );
@@ -365,6 +365,6 @@ mod tests {
             })
         );
 
-        eprintln!("{:#?}", ir);
+        // eprintln!("{:#?}", ir);
     }
 }

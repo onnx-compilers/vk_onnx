@@ -1,9 +1,9 @@
 use core::result::Result as CoreResult;
 
-use crate::l_base::TranslateFrom;
+use crate::l_base::{TranslateFrom, ScalarTy};
 use crate::l0;
 
-pub use crate::l0::{Output, Parameter, Temporary, Ty, Value};
+pub use crate::l0::{Output, Parameter, Temporary, Value};
 
 #[derive(Debug, Clone)]
 pub struct IR {
@@ -20,7 +20,7 @@ pub struct Instruction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argument {
-    pub ty: Ty,
+    pub ty: ScalarTy,
     pub shape: Vec<usize>,
     pub batch_dim: Option<BatchDimension>,
 }
@@ -187,7 +187,7 @@ impl<'a> IRBuilder<'a> {
     }
 }
 
-fn match_ty(lhs: Ty, rhs: Ty) -> CoreResult<Ty, InstructionError> {
+fn match_ty(lhs: ScalarTy, rhs: ScalarTy) -> CoreResult<ScalarTy, InstructionError> {
     if lhs == rhs {
         Ok(lhs)
     } else {
@@ -270,11 +270,11 @@ mod tests {
             inputs: vec![
                 l0::Input {
                     shape: vec![None, Some(2)],
-                    ty: l0::Ty::F32,
+                    ty: ScalarTy::F32,
                 },
                 l0::Input {
                     shape: vec![None, Some(2)],
-                    ty: l0::Ty::F32,
+                    ty: ScalarTy::F32,
                 },
             ],
             outputs: vec![l0::Output {
@@ -291,11 +291,11 @@ mod tests {
         assert_eq!(ir.inputs.len(), 2);
         assert_eq!(ir.outputs.len(), 1);
         assert_eq!(ir.instructions.len(), 1);
-        eprintln!("{:#?}", ir);
-        ir.outputs
-            .iter()
-            .enumerate()
-            .map(|(i, o)| { (o, ir.output_data(i).unwrap()) })
-            .for_each(|(o, d)| eprintln!("{:?} -> {:?}", o, d) );
+        // eprintln!("{:#?}", ir);
+        // ir.outputs
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(i, o)| { (o, ir.output_data(i).unwrap()) })
+        //     .for_each(|(o, d)| eprintln!("{:?} -> {:?}", o, d) );
     }
 }
