@@ -8,7 +8,7 @@ use crate::protos::onnx::tensor_proto::DataType;
 use crate::protos::onnx::tensor_shape_proto::{Dimension, dimension};
 use crate::protos::onnx::{self, TensorShapeProto, ValueInfoProto, type_proto};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct IR {
     pub operations: Vec<Operation>,
     pub input_names: Vec<String>,
