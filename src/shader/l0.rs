@@ -18,7 +18,7 @@ pub struct IR {
 #[derive(Default, Debug, Clone)]
 pub struct IRConfig {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub ret: Ty,
     pub args: Vec<Ty>,
@@ -27,14 +27,20 @@ pub struct Function {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
-    Value(Ty, ValueNodeId),
+    Value(ValueNodeId),
     ReturnValue(Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValueNode {
+pub enum ValueNodeOp {
     Load(Value),
     IAdd(Value, Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueNode {
+    pub ty: Ty,
+    pub op: ValueNodeOp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,8 +61,9 @@ pub struct Blob {
     pub end_idx: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
+    #[default]
     Void,
     Scalar(ScalarTy),
     Vec2(ScalarTy),
@@ -91,14 +98,24 @@ pub struct ValueNodeId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parameter(pub usize);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Temporary(pub usize);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     Parameter(Parameter),
     Temporary(Temporary),
+}
+
+#[derive(Debug)]
+pub enum Error {
+    AssemblerError(rspirv::dr::Error),
+    ReturnTypeMismatch(Ty),
+}
+
+impl From<rspirv::dr::Error> for Error {
+    fn from(e: rspirv::dr::Error) -> Self {
+        Error::AssemblerError(e)
+    }
 }
 
 struct AssemblerTypes {
@@ -108,8 +125,17 @@ struct AssemblerTypes {
     s32: Word,
 }
 
+struct FunctionCompiler<'a> {
+    types: &'a AssemblerTypes,
+    function: &'a Function,
+    ir: &'a IR,
+    parameter_ids: Box<[u32]>,
+    value_ids: Vec<u32>,
+    func_id: u32,
+}
+
 impl TranslateFrom<IR> for SPVModule {
-    type Error = rspirv::dr::Error;
+    type Error = Error;
     fn translate_from(ir: IR) -> Result<Self, Self::Error> {
         let mut b = SPVBuilder::new();
         b.capability(spirv::Capability::Shader);
@@ -132,63 +158,10 @@ impl TranslateFrom<IR> for SPVModule {
         };
         let mut spirv_functions = Vec::with_capacity(ir.functions.len());
 
-        for func in ir.functions.iter() {
-            // TODO: Move this into a function
-            let Function { ret, .. } = func;
-            let ret = ret.to_assembler(&ir.types, &types);
-            let args = func
-                .args
-                .iter()
-                .map(|ty| ty.to_assembler(&ir.types, &types))
-                .collect::<Box<[_]>>();
-            let func_ty_id = b.type_function(ret, args.clone());
-            let func_id = b.begin_function(
-                ret,
-                None,
-                spirv::FunctionControl::DONT_INLINE,
-                func_ty_id,
-            )?;
-            let parameter_ids = args
-                .into_iter()
-                .map(|id| b.function_parameter(id))
-                .collect::<Result<Box<[_]>, Self::Error>>()?;
-
-            let _block_id = b.begin_block_no_label(None)?;
-
-            let mut value_ids = Vec::new();
-
-            // TODO: Move this into a proper function
-            let get_value = |value_ids: &[Word], v| match v {
-                Value::Parameter(Parameter(i)) => parameter_ids[i],
-                Value::Temporary(Temporary(i)) => value_ids[i],
-            };
-
-            for &NodeId(node_id) in func.body.iter() {
-                match &ir.nodes[node_id] {
-                    Node::Value(ty, ValueNodeId(value_node_idx)) => {
-                        assert!(*value_node_idx == value_ids.len());
-                        match &ir.value_nodes[*value_node_idx] {
-                            ValueNode::IAdd(lhs, rhs) => {
-                                let lhs = get_value(&value_ids, *lhs);
-                                let rhs = get_value(&value_ids, *rhs);
-                                let op_id = b.i_add(
-                                    ty.to_assembler(&ir.types, &types),
-                                    None,
-                                    lhs,
-                                    rhs,
-                                )?;
-                                value_ids.push(op_id);
-                            }
-                            _ => todo!(),
-                        }
-                    }
-                    &Node::ReturnValue(value) => {
-                        let value = get_value(&value_ids, value);
-                        b.ret_value(value)?;
-                    }
-                }
-            }
-            b.end_function()?;
+        for i in 0..ir.functions.len() {
+            let func_id =
+                FunctionCompiler::new(&mut b, &types, &ir.functions[i], &ir)?
+                    .compile(&mut b)?;
             spirv_functions.push(func_id);
         }
 
@@ -203,25 +176,47 @@ impl IR {
             ..Default::default()
         }
     }
-    pub fn new_type(&mut self, ty: CompositeTy) -> TyId {
+    pub fn make_type(&mut self, ty: CompositeTy) -> TyId {
         let id = self.types.len();
         self.types.push(ty);
         TyId(id)
     }
-    pub fn new_function(&mut self, func: Function) -> FunctionId {
+    pub fn make_function(&mut self, func: Function) -> FunctionId {
         let id = self.functions.len();
         self.functions.push(func);
         FunctionId(id)
     }
-    pub fn new_node(&mut self, node: Node) -> NodeId {
+    pub fn make_node(&mut self, node: Node) -> NodeId {
         let id = self.nodes.len();
         self.nodes.push(node);
         NodeId(id)
     }
-    pub fn new_value_node(&mut self, value: ValueNode) -> (ValueNodeId, Value) {
+    pub fn make_value_node(
+        &mut self,
+        value: ValueNode,
+    ) -> (ValueNodeId, Value) {
         let id = self.value_nodes.len();
         self.value_nodes.push(value);
         (ValueNodeId(id), Value::temporary(id))
+    }
+}
+
+impl Function {
+    pub fn new(ret: Ty) -> Self {
+        Self { ret, ..Default::default() }
+    }
+    pub fn make_argument(&mut self, ty: Ty) -> Value {
+        let id = self.args.len();
+        self.args.push(ty);
+        Value::Parameter(Parameter(id))
+    }
+
+    pub fn append_node(&mut self, node: NodeId) {
+        self.body.push(node);
+    }
+
+    pub fn return_value(&mut self, ir: &mut IR, value: Value) {
+        self.body.push(ir.make_node(Node::ReturnValue(value)));
     }
 }
 
@@ -241,7 +236,7 @@ impl Ty {
     }
 
     pub fn same_as(&self, other: &Ty, _composites: &[CompositeTy]) -> bool {
-        self == other // TODO: composite comparison
+        dbg!(dbg!(self) == dbg!(other)) // TODO: composite comparison
     }
 }
 
@@ -254,6 +249,117 @@ impl Value {
     }
 }
 
+impl<'a> FunctionCompiler<'a> {
+    pub fn new(
+        b: &mut SPVBuilder,
+        types: &'a AssemblerTypes,
+        func: &'a Function,
+        ir: &'a IR,
+    ) -> Result<Self, rspirv::dr::Error> {
+        let Function { ret, .. } = func;
+        let ret = ret.to_assembler(&ir.types, &types);
+        let args = func
+            .args
+            .iter()
+            .map(|ty| ty.to_assembler(&ir.types, &types))
+            .collect::<Box<[_]>>();
+        let func_ty_id = b.type_function(ret, args.clone());
+        let func_id = b.begin_function(
+            ret,
+            None,
+            spirv::FunctionControl::DONT_INLINE,
+            func_ty_id,
+        )?;
+        let parameter_ids = args
+            .into_iter()
+            .map(|id| b.function_parameter(id))
+            .collect::<Result<Box<[_]>, rspirv::dr::Error>>()?;
+        Ok(FunctionCompiler {
+            types,
+            function: func,
+            ir,
+            func_id,
+            value_ids: Vec::new(),
+            parameter_ids,
+        })
+    }
+
+    fn get_value(&self, v: Value) -> Word {
+        match v {
+            Value::Parameter(Parameter(i)) => self.parameter_ids[i],
+            Value::Temporary(Temporary(i)) => self.value_ids[i],
+        }
+    }
+
+    pub fn compile(
+        mut self,
+        b: &mut SPVBuilder,
+    ) -> Result<u32, Error> {
+        let _block_id = b.begin_block(None)?;
+
+        for &NodeId(node_id) in self.function.body.iter() {
+            let node = &self.ir.nodes[node_id];
+            let () = self.compile_node(b, node)?;
+        }
+        b.end_function()?;
+        Ok(self.func_id)
+    }
+
+    fn compile_node(
+        &mut self,
+        b: &mut SPVBuilder,
+        node: &Node,
+    ) -> Result<(), Error> {
+        match node {
+            Node::Value(ValueNodeId(value_node_idx)) => {
+                let value_node = &self.ir.value_nodes[*value_node_idx];
+                let () = self.compile_value_node(b, value_node)?;
+            }
+            &Node::ReturnValue(value) => {
+                let ty = self.get_value_type(value);
+                let value = self.get_value(value);
+                if !ty.same_as(&self.function.ret, &self.ir.types) {
+                    return Err(Error::ReturnTypeMismatch(ty.clone()));
+                }
+                b.ret_value(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_value_type(&self, v: Value) -> &Ty {
+        match v {
+            Value::Parameter(Parameter(i)) => &self.function.args[i],
+            Value::Temporary(Temporary(i)) => &self.ir.value_nodes[i].ty,
+        }
+    }
+
+    fn compile_value_node(
+        &mut self,
+        b: &mut SPVBuilder,
+        node: &ValueNode,
+    ) -> Result<(), rspirv::dr::Error> {
+        match node {
+            ValueNode {
+                ty,
+                op: ValueNodeOp::IAdd(lhs, rhs),
+            } => {
+                let lhs = self.get_value(*lhs);
+                let rhs = self.get_value(*rhs);
+                let op_id = b.i_add(
+                    ty.to_assembler(&self.ir.types, self.types),
+                    None,
+                    lhs,
+                    rhs,
+                )?;
+                self.value_ids.push(op_id);
+            }
+            _ => todo!(),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,22 +369,26 @@ mod tests {
     #[test]
     fn test() {
         let mut ir = IR::new(IRConfig {});
-        let (add_node, add_result) = ir.new_value_node(ValueNode::IAdd(
-            Value::parameter(0),
-            Value::parameter(1),
-        ));
-        let val = ir.new_node(Node::Value(Ty::Scalar(ScalarTy::U32), add_node));
-        let ret = ir.new_node(Node::ReturnValue(add_result));
-        ir.new_function(Function {
-            ret: Ty::Scalar(ScalarTy::U32),
-            args: [ScalarTy::U32, ScalarTy::U32]
-                .into_iter()
-                .map(Ty::Scalar)
-                .collect(),
-            body: vec![val, ret],
+        let mut func = Function::new(Ty::Scalar(ScalarTy::U32));
+        let a = func.make_argument(Ty::Scalar(ScalarTy::U32));
+        let b = func.make_argument(Ty::Scalar(ScalarTy::U32));
+        let (add_node, add_result) = ir.make_value_node(ValueNode {
+            ty: Ty::Scalar(ScalarTy::U32),
+            op: ValueNodeOp::IAdd(a, b),
         });
+        let val =
+            ir.make_node(Node::Value(add_node));
+        func.append_node(val);
+        func.return_value(&mut ir, add_result);
+        ir.make_function(func);
         let module = SPVModule::translate_from(ir).unwrap();
         eprintln!("{}", module.disassemble());
-        assert_ne!(module.assemble().len(), 0);
+        let raw = module.assemble();
+        assert_ne!(raw.len(), 0);
+        let mut loader = rspirv::dr::Loader::new();
+        // to make sure it's actually valid
+        let () =
+            rspirv::binary::parse_words(raw.as_slice(), &mut loader).unwrap();
+        eprintln!("{}", loader.module().assemble() == raw);
     }
 }
