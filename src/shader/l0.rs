@@ -1,10 +1,9 @@
-use crate::l_base::ScalarTy;
+use crate::l_base::{ScalarTy, TranslateFrom};
 
-use rspirv::binary::{Assemble, Disassemble};
-use rspirv::dr::Builder as SPVBuilder;
+use rspirv::dr::{Builder as SPVBuilder, Module as SPVModule};
 use rspirv::spirv::{self, Word};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct IR {
     pub functions: Vec<Function>,
     pub buffers: Vec<Buffer>,
@@ -12,6 +11,7 @@ pub struct IR {
     pub blobs: Vec<Blob>,
     pub types: Vec<CompositeTy>,
     pub nodes: Vec<Node>,
+    pub value_nodes: Vec<ValueNode>,
     pub config: IRConfig,
 }
 
@@ -27,8 +27,14 @@ pub struct Function {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
-    Store(TyId, NodeId),
-    Load(TyId),
+    Value(Ty, ValueNodeId),
+    ReturnValue(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueNode {
+    Load(Value),
+    IAdd(Value, Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +86,20 @@ pub struct BlobId(pub usize);
 pub struct TyId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeId(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueNodeId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parameter(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Temporary(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    Parameter(Parameter),
+    Temporary(Temporary),
+}
 
 struct AssemblerTypes {
     void: Word,
@@ -88,10 +108,18 @@ struct AssemblerTypes {
     s32: Word,
 }
 
-impl Assemble for IR {
-    fn assemble_into(&self, result: &mut Vec<u32>) {
+impl TranslateFrom<IR> for SPVModule {
+    type Error = rspirv::dr::Error;
+    fn translate_from(ir: IR) -> Result<Self, Self::Error> {
         let mut b = SPVBuilder::new();
+        b.capability(spirv::Capability::Shader);
         b.ext_inst_import("GLSL.std.450");
+        b.source(
+            spirv::SourceLanguage::Unknown,
+            0,
+            None,
+            Option::<&str>::None,
+        );
         b.memory_model(
             spirv::AddressingModel::Logical,
             spirv::MemoryModel::GLSL450,
@@ -102,43 +130,77 @@ impl Assemble for IR {
             u32: b.type_int(32, 0),
             s32: b.type_int(32, 1),
         };
-        let mut spirv_functions = Vec::with_capacity(self.functions.len());
+        let mut spirv_functions = Vec::with_capacity(ir.functions.len());
 
-        for func in self.functions.iter() {
+        for func in ir.functions.iter() {
+            // TODO: Move this into a function
             let Function { ret, .. } = func;
-            let ret = ret.to_assembler(&self.types, &types);
+            let ret = ret.to_assembler(&ir.types, &types);
             let args = func
                 .args
                 .iter()
-                .map(|ty| ty.to_assembler(&self.types, &types))
+                .map(|ty| ty.to_assembler(&ir.types, &types))
                 .collect::<Box<[_]>>();
-            let func_ty_id = b.type_function(ret, args);
+            let func_ty_id = b.type_function(ret, args.clone());
             let func_id = b.begin_function(
                 ret,
                 None,
                 spirv::FunctionControl::DONT_INLINE,
                 func_ty_id,
-            );
-            b.end_function().unwrap();
+            )?;
+            let parameter_ids = args
+                .into_iter()
+                .map(|id| b.function_parameter(id))
+                .collect::<Result<Box<[_]>, Self::Error>>()?;
+
+            let _block_id = b.begin_block_no_label(None)?;
+
+            let mut value_ids = Vec::new();
+
+            // TODO: Move this into a proper function
+            let get_value = |value_ids: &[Word], v| match v {
+                Value::Parameter(Parameter(i)) => parameter_ids[i],
+                Value::Temporary(Temporary(i)) => value_ids[i],
+            };
+
+            for &NodeId(node_id) in func.body.iter() {
+                match &ir.nodes[node_id] {
+                    Node::Value(ty, ValueNodeId(value_node_idx)) => {
+                        assert!(*value_node_idx == value_ids.len());
+                        match &ir.value_nodes[*value_node_idx] {
+                            ValueNode::IAdd(lhs, rhs) => {
+                                let lhs = get_value(&value_ids, *lhs);
+                                let rhs = get_value(&value_ids, *rhs);
+                                let op_id = b.i_add(
+                                    ty.to_assembler(&ir.types, &types),
+                                    None,
+                                    lhs,
+                                    rhs,
+                                )?;
+                                value_ids.push(op_id);
+                            }
+                            _ => todo!(),
+                        }
+                    }
+                    &Node::ReturnValue(value) => {
+                        let value = get_value(&value_ids, value);
+                        b.ret_value(value)?;
+                    }
+                }
+            }
+            b.end_function()?;
             spirv_functions.push(func_id);
         }
 
-        let module = b.module();
-        eprintln!("{}", module.disassemble());
-        module.assemble_into(result);
+        Ok(b.module())
     }
 }
 
 impl IR {
     pub fn new(config: IRConfig) -> Self {
         Self {
-            functions: Vec::new(),
-            buffers: Vec::new(),
-            blobs_data: Vec::new(),
-            blobs: Vec::new(),
-            types: Vec::new(),
-            nodes: Vec::new(),
             config,
+            ..Default::default()
         }
     }
     pub fn new_type(&mut self, ty: CompositeTy) -> TyId {
@@ -156,6 +218,11 @@ impl IR {
         self.nodes.push(node);
         NodeId(id)
     }
+    pub fn new_value_node(&mut self, value: ValueNode) -> (ValueNodeId, Value) {
+        let id = self.value_nodes.len();
+        self.value_nodes.push(value);
+        (ValueNodeId(id), Value::temporary(id))
+    }
 }
 
 impl Ty {
@@ -172,26 +239,46 @@ impl Ty {
             _ => todo!(),
         }
     }
+
+    pub fn same_as(&self, other: &Ty, _composites: &[CompositeTy]) -> bool {
+        self == other // TODO: composite comparison
+    }
+}
+
+impl Value {
+    pub fn temporary(i: usize) -> Self {
+        Value::Temporary(Temporary(i))
+    }
+    pub fn parameter(i: usize) -> Self {
+        Value::Parameter(Parameter(i))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use rspirv::binary::{Assemble, Disassemble};
+
     #[test]
     fn test() {
         let mut ir = IR::new(IRConfig {});
+        let (add_node, add_result) = ir.new_value_node(ValueNode::IAdd(
+            Value::parameter(0),
+            Value::parameter(1),
+        ));
+        let val = ir.new_node(Node::Value(Ty::Scalar(ScalarTy::U32), add_node));
+        let ret = ir.new_node(Node::ReturnValue(add_result));
         ir.new_function(Function {
-            ret: Ty::Void,
-            args: [ScalarTy::F32, ScalarTy::F32]
+            ret: Ty::Scalar(ScalarTy::U32),
+            args: [ScalarTy::U32, ScalarTy::U32]
                 .into_iter()
                 .map(Ty::Scalar)
                 .collect(),
-            body: vec![],
+            body: vec![val, ret],
         });
-        let spirv = ir.assemble();
-        assert_ne!(spirv.len(), 0);
+        let module = SPVModule::translate_from(ir).unwrap();
+        eprintln!("{}", module.disassemble());
+        assert_ne!(module.assemble().len(), 0);
     }
 }
-
-

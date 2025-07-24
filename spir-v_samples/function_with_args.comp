@@ -1,0 +1,35 @@
+#version 450
+
+layout (local_size_x = 0x100) in;
+
+layout (set = 0, binding = 1) uniform Config {
+  int size;
+} config;
+
+layout (set = 0, binding = 1) readonly buffer InputBufferA {
+  int values[];
+} inputA;
+
+layout (set = 0, binding = 2) readonly buffer InputBufferB {
+  int values[];
+} inputB;
+
+layout (set = 0, binding = 2) buffer OutputBufferC {
+  int values[];
+} outputC;
+
+int add(const int, const int);
+
+void main() {
+  uint gID = gl_GlobalInvocationID.x;
+  int a = inputA.values[gID];
+  int b = inputB.values[gID];
+  int c = add(a, b);
+  if (gID < config.size) {
+    outputC.values[gID] = c;
+  }
+}
+
+int add(const int a, const int b) {
+  return a + b;
+}
