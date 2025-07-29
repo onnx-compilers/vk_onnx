@@ -9,9 +9,16 @@ pub struct IR {
     pub buffers: Vec<Buffer>,
     pub blobs_data: Vec<u8>,
     pub blobs: Vec<Blob>,
-    pub types: Vec<CompositeTy>,
+    pub composite_types: Vec<CompositeTy>,
+    pub ptr_types: Vec<Ty>,
     pub config: IRConfig,
     pub entry_point: Option<FunctionId>,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct Types<'a> {
+    pub composite: &'a [CompositeTy],
+    pub ptr: &'a [Ty],
 }
 
 #[derive(Default, Debug, Clone)]
@@ -22,7 +29,7 @@ pub struct Function {
     pub name: Option<String>,
     pub ret: Option<Ty>,
     pub args: Vec<Ty>,
-    pub vars: Vec<(TyId, Option<Value>)>,
+    pub vars: Vec<(PtrTyId, StorageClass, Option<Value>)>,
     pub body: Vec<Node>,
     pub value_nodes: Vec<ValueNode>,
 }
@@ -38,7 +45,8 @@ pub enum Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueNodeOp {
     Load(Value),
-    Add(Value, Value),
+    IAdd(Value, Value),
+    FAdd(Value, Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,12 +58,13 @@ pub struct ValueNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Buffer {
     pub blob: Option<BlobId>,
-    pub ty: TyId,
+    pub ty: CompositeTyId,
     pub layout: BufferLayout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferLayout {
+    pub descriptor_set: Word,
     pub binding: Word,
 }
 
@@ -70,12 +79,12 @@ pub enum Ty {
     Scalar(ScalarTy),
     Vec(ScalarTy, u32),
     Mat(ScalarTy, u32),
-    Composite(TyId),
+    Ptr(PtrTyId, StorageClass),
+    Composite(CompositeTyId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositeTy {
-    Pointer(Ty, StorageClass),
     Array1(Ty, Option<usize>),
     Array2(Ty, Option<usize>, usize),
     Array3(Ty, Option<usize>, usize, usize),
@@ -89,7 +98,9 @@ pub struct BufferId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TyId(pub usize);
+pub struct CompositeTyId(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtrTyId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueNodeId(pub usize);
 
@@ -106,12 +117,31 @@ pub enum Value {
     Variable(Variable),
 }
 
+impl From<Parameter> for Value {
+    fn from(p: Parameter) -> Self {
+        Value::Parameter(p)
+    }
+}
+
+impl From<Temporary> for Value {
+    fn from(t: Temporary) -> Self {
+        Value::Temporary(t)
+    }
+}
+
+impl From<Variable> for Value {
+    fn from(v: Variable) -> Self {
+        Value::Variable(v)
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     AssemblerError(rspirv::dr::Error),
     MissingEntrypoinName,
     ReturnInVoid,
     ReturnTypeMismatch(Ty),
+    WrongNumberType(ScalarTy),
 }
 
 impl From<rspirv::dr::Error> for Error {
@@ -120,8 +150,8 @@ impl From<rspirv::dr::Error> for Error {
     }
 }
 
-impl From<TyId> for Ty {
-    fn from(id: TyId) -> Self {
+impl From<CompositeTyId> for Ty {
+    fn from(id: CompositeTyId) -> Self {
         Ty::Composite(id)
     }
 }
@@ -130,6 +160,7 @@ impl From<TyId> for Ty {
 struct LazyTypeMapper {
     void: Option<Word>,
     composites: Box<[Option<Word>]>,
+    ptrs: Box<[Option<Word>]>,
     scalars: LazyScalarTypeMapper,
     vectors: [LazyScalarTypeMapper; 3],
     matrices: [LazyScalarTypeMapper; 3],
@@ -145,7 +176,7 @@ struct LazyScalarTypeMapper {
 struct FunctionCompiler<'a> {
     type_mapper: &'a mut LazyTypeMapper,
     function: &'a Function,
-    types: &'a [CompositeTy],
+    types: Types<'a>,
     parameter_ids: Box<[u32]>,
     variable_ids: Box<[u32]>,
     value_ids: Vec<u32>,
@@ -168,7 +199,8 @@ impl TranslateFrom<IR> for SPVModule {
             spirv::AddressingModel::Logical,
             spirv::MemoryModel::GLSL450,
         );
-        let mut type_mapper = LazyTypeMapper::new(ir.types.len());
+
+        let mut type_mapper = LazyTypeMapper::new(ir.types());
         let mut spirv_functions = Vec::with_capacity(ir.functions.len());
 
         for i in 0..ir.functions.len() {
@@ -205,11 +237,26 @@ impl IR {
             ..Default::default()
         }
     }
-    pub fn make_type(&mut self, ty: CompositeTy) -> TyId {
-        let id = self.types.len();
-        self.types.push(ty);
-        TyId(id)
+
+    pub fn types(&self) -> Types {
+        Types {
+            composite: &self.composite_types,
+            ptr: &self.ptr_types,
+        }
     }
+
+    pub fn make_ptr_type(&mut self, ty: Ty) -> PtrTyId {
+        let id = self.ptr_types.len();
+        self.ptr_types.push(ty);
+        PtrTyId(id)
+    }
+
+    pub fn make_composite_type(&mut self, ty: CompositeTy) -> CompositeTyId {
+        let id = self.composite_types.len();
+        self.composite_types.push(ty);
+        CompositeTyId(id)
+    }
+
     pub fn make_function(&mut self, func: Function) -> FunctionId {
         let (id, _) = self.make_function_mut(func);
         id
@@ -223,6 +270,12 @@ impl IR {
         self.functions.push(func);
         let func = &mut self.functions[id];
         (FunctionId(id), func)
+    }
+
+    pub fn make_buffer(&mut self, buffer: Buffer) -> BufferId {
+        let id = self.buffers.len();
+        self.buffers.push(buffer);
+        BufferId(id)
     }
 
     pub fn entry_point(&mut self, func_id: FunctionId) {
@@ -239,23 +292,27 @@ impl Function {
         }
     }
 
-    pub fn make_argument(&mut self, ty: Ty) -> Value {
+    pub fn make_argument(&mut self, ty: Ty) -> Parameter {
         let id = self.args.len();
         self.args.push(ty);
-        Value::Parameter(Parameter(id))
+        Parameter(id)
     }
 
-    pub fn make_variable(&mut self, ty: TyId) -> Value {
+    pub fn make_variable(
+        &mut self,
+        ty: PtrTyId,
+        storage_class: StorageClass,
+    ) -> Variable {
         let id = self.vars.len();
-        self.vars.push((ty, None));
-        Value::Variable(Variable(id))
+        self.vars.push((ty, storage_class, None));
+        Variable(id)
     }
 
     pub fn append_node(&mut self, node: Node) {
         self.body.push(node);
     }
 
-    pub fn append_value_node(&mut self, node: ValueNode) -> Value {
+    pub fn append_value_node(&mut self, node: ValueNode) -> Temporary {
         let (id, value) = self.make_value_node(node);
         self.body.push(Node::Value(id));
         value
@@ -268,17 +325,15 @@ impl Function {
     pub fn make_value_node(
         &mut self,
         value: ValueNode,
-    ) -> (ValueNodeId, Value) {
+    ) -> (ValueNodeId, Temporary) {
         let id = self.value_nodes.len();
         self.value_nodes.push(value);
-        (ValueNodeId(id), Value::temporary(id))
+        (ValueNodeId(id), Temporary(id))
     }
-
-    // pub fn make_variable()
 }
 
 impl Ty {
-    pub fn same_as(&self, other: &Ty, _composites: &[CompositeTy]) -> bool {
+    pub fn same_as(&self, other: &Ty, _types: Types<'_>) -> bool {
         self == other // TODO: composite comparison
     }
 }
@@ -288,8 +343,12 @@ impl ValueNode {
         Self { ty, op }
     }
 
-    pub fn add(ty: Ty, a: Value, b: Value) -> Self {
-        Self::new(ty, ValueNodeOp::Add(a, b))
+    pub fn iadd(ty: Ty, a: Value, b: Value) -> Self {
+        Self::new(ty, ValueNodeOp::IAdd(a, b))
+    }
+
+    pub fn fadd(ty: Ty, a: Value, b: Value) -> Self {
+        Self::new(ty, ValueNodeOp::FAdd(a, b))
     }
 
     pub fn load(ty: Ty, a: Value) -> Self {
@@ -304,6 +363,10 @@ impl Value {
     pub fn parameter(i: usize) -> Self {
         Value::Parameter(Parameter(i))
     }
+
+    pub fn variable(i: usize) -> Self {
+        Value::Variable(Variable(i))
+    }
 }
 
 impl<'a> FunctionCompiler<'a> {
@@ -315,12 +378,12 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<Self, rspirv::dr::Error> {
         let Function { ret: maybe_ret, .. } = func;
         let ret = maybe_ret
-            .map(|ret| type_mapper.get(b, &ir.types, &ret))
+            .map(|ret| type_mapper.get(b, ir.types(), &ret))
             .unwrap_or_else(|| type_mapper.get_void(b));
         let args = func
             .args
             .iter()
-            .map(|ty| type_mapper.get(b, &ir.types, &ty))
+            .map(|ty| type_mapper.get(b, ir.types(), &ty))
             .collect::<Box<[_]>>();
         let func_ty_id = b.type_function(ret, args.clone());
         let func_id = b.begin_function(
@@ -335,15 +398,20 @@ impl<'a> FunctionCompiler<'a> {
             .map(|id| b.function_parameter(id))
             .collect::<Result<Box<[_]>, rspirv::dr::Error>>()?;
         // TODO: handle initializers
-        let variable_ids = func.vars.iter().map(|&(ty, _init)| {
-            let ty_id = type_mapper.get(b, &ir.types, &Ty::Composite(ty));
-            // let init = init.map(|init| b.variable(ty_id, None, StorageClass::Function, init));
-            b.variable(ty_id, None, StorageClass::Function, None)
-        }).collect();
+        let variable_ids = func
+            .vars
+            .iter()
+            .map(|&(ty, storage_class, _init)| {
+                let ty_id =
+                    type_mapper.get_ptr(b, ir.types(), ty, storage_class);
+                // let init = init.map(|init| b.variable(ty_id, None, StorageClass::Function, init));
+                b.variable(ty_id, None, StorageClass::Function, None)
+            })
+            .collect();
         Ok(FunctionCompiler {
             type_mapper,
             function: func,
-            types: &ir.types,
+            types: ir.types(),
             func_id,
             value_ids: Vec::new(),
             parameter_ids,
@@ -404,7 +472,9 @@ impl<'a> FunctionCompiler<'a> {
         match v {
             Value::Parameter(Parameter(i)) => self.function.args[i],
             Value::Temporary(Temporary(i)) => self.function.value_nodes[i].ty,
-            Value::Variable(Variable(i)) => Ty::Composite(self.function.vars[i].0),
+            Value::Variable(Variable(i)) => {
+                Ty::Ptr(self.function.vars[i].0, StorageClass::Function)
+            }
         }
     }
 
@@ -412,12 +482,12 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         b: &mut SPVBuilder,
         node: &ValueNode,
-    ) -> Result<(), rspirv::dr::Error> {
+    ) -> Result<(), Error> {
         type Op = ValueNodeOp;
         match node {
             ValueNode {
                 ty,
-                op: Op::Add(lhs, rhs),
+                op: Op::IAdd(lhs, rhs),
             } => {
                 let lhs = self.get_value(*lhs);
                 let rhs = self.get_value(*rhs);
@@ -428,12 +498,30 @@ impl<'a> FunctionCompiler<'a> {
                     &Ty::Vec(ty, _n) => ty,
                     _ => todo!(),
                 };
-                let op_id = match inner_ty {
-                    ScalarTy::U32 | ScalarTy::S32 => {
-                        b.i_add(ty_id, None, lhs, rhs)?
-                    }
-                    ScalarTy::F32 => b.f_add(ty_id, None, lhs, rhs)?,
+                if !matches!(inner_ty, ScalarTy::U32 | ScalarTy::S32) {
+                    return Err(Error::WrongNumberType(inner_ty));
+                }
+                let op_id = b.i_add(ty_id, None, lhs, rhs)?;
+                self.value_ids.push(op_id);
+            }
+
+            ValueNode {
+                ty,
+                op: Op::FAdd(lhs, rhs),
+            } => {
+                let lhs = self.get_value(*lhs);
+                let rhs = self.get_value(*rhs);
+                // TODO: Check type compatibility for operation
+                let ty_id = self.type_mapper.get(b, self.types, ty);
+                let inner_ty = match ty {
+                    &Ty::Scalar(ty) => ty,
+                    &Ty::Vec(ty, _n) => ty,
+                    _ => todo!(),
                 };
+                if !matches!(inner_ty, ScalarTy::F32) {
+                    return Err(Error::WrongNumberType(inner_ty));
+                }
+                let op_id = b.f_add(ty_id, None, lhs, rhs)?;
                 self.value_ids.push(op_id);
             }
 
@@ -453,56 +541,65 @@ impl<'a> FunctionCompiler<'a> {
 }
 
 impl LazyTypeMapper {
-    fn new(n_composites: usize) -> Self {
+    fn new(types: Types<'_>) -> Self {
         Self {
-            composites: vec![None; n_composites].into_boxed_slice(),
+            composites: vec![None; types.composite.len()].into_boxed_slice(),
+            ptrs: vec![None; types.ptr.len()].into_boxed_slice(),
             ..Default::default()
         }
+    }
+
+    fn get(&mut self, b: &mut SPVBuilder, types: Types<'_>, ty: &Ty) -> Word {
+        match ty {
+            &Ty::Scalar(ty) => self.scalars.get(b, ty),
+            &Ty::Vec(ty, n) => *self.vectors[n as usize - 2]
+                .access_mut(ty)
+                .get_or_insert_with(|| {
+                    let base = self.scalars.get(b, ty);
+                    b.type_vector(base, n)
+                }),
+            &Ty::Mat(ty, n) => *self.matrices[n as usize - 2]
+                .access_mut(ty)
+                .get_or_insert_with(|| {
+                    let base = self.scalars.get(b, ty);
+                    b.type_matrix(base, n)
+                }),
+            &Ty::Ptr(ty, storage_class) => {
+                self.get_ptr(b, types, ty, storage_class)
+            }
+            &Ty::Composite(ty) => self.get_composite(b, types, ty),
+        }
+    }
+
+    fn get_ptr(
+        &mut self,
+        b: &mut SPVBuilder,
+        types: Types<'_>,
+        ptr_ty: PtrTyId,
+        storage_class: StorageClass,
+    ) -> Word {
+        let Some(ty) = types.ptr.get(ptr_ty.0) else {
+            unreachable!()
+        };
+        let base = self.get(b, types, ty);
+        *self.ptrs[ptr_ty.0]
+            .get_or_insert_with(|| b.type_pointer(None, storage_class, base))
     }
 
     fn get_void(&mut self, b: &mut SPVBuilder) -> Word {
         *self.void.get_or_insert_with(|| b.type_void())
     }
 
-    fn get(
-        &mut self,
-        b: &mut SPVBuilder,
-        composites: &[CompositeTy],
-        ty: &Ty,
-    ) -> Word {
-        match ty {
-            &Ty::Scalar(ty) => self.scalars.get(b, ty),
-            &Ty::Vec(ty, n) => self.scalars.get_transfer_map(
-                &mut self.vectors[n as usize - 2],
-                b,
-                ty,
-                |b, id| b.type_vector(id, n),
-            ),
-            &Ty::Mat(ty, n) => self.scalars.get_transfer_map(
-                &mut self.matrices[n as usize - 2],
-                b,
-                ty,
-                |b, id| b.type_matrix(id, n),
-            ),
-            &Ty::Composite(ty) => self.get_composite(b, composites, ty),
-        }
-    }
-
     fn get_composite(
         &mut self,
-        b: &mut SPVBuilder,
-        composites: &[CompositeTy],
-        ty: TyId,
+        _b: &mut SPVBuilder,
+        types: Types<'_>,
+        ty: CompositeTyId,
     ) -> Word {
-        let TyId(i) = ty;
-        let ty = &composites[i];
+        let CompositeTyId(i) = ty;
+        let ty = &types.composite[i];
         let (is_found, id) = match self.composites[i] {
             None => match ty {
-                CompositeTy::Pointer(ty, storage_class) => {
-                    let base = self.get(b, composites, &ty);
-                    let id = b.type_pointer(None, *storage_class, base);
-                    (false, id)
-                }
                 _ => todo!(),
             },
             Some(id) => (true, id),
@@ -515,38 +612,19 @@ impl LazyTypeMapper {
 }
 
 impl LazyScalarTypeMapper {
+    fn access_mut(&mut self, ty: ScalarTy) -> &mut Option<Word> {
+        match ty {
+            ScalarTy::F32 => &mut self.f32,
+            ScalarTy::U32 => &mut self.u32,
+            ScalarTy::S32 => &mut self.s32,
+        }
+    }
+
     fn get(&mut self, b: &mut SPVBuilder, ty: ScalarTy) -> Word {
         *match ty {
             ScalarTy::F32 => self.f32.get_or_insert_with(|| b.type_float(32)),
             ScalarTy::U32 => self.u32.get_or_insert_with(|| b.type_int(32, 0)),
             ScalarTy::S32 => self.s32.get_or_insert_with(|| b.type_int(32, 1)),
-        }
-    }
-
-    // TODO: Make the function return a closure which modifies the member instead
-    fn get_transfer_map<F>(
-        &mut self,
-        other: &mut Self,
-        b: &mut SPVBuilder,
-        ty: ScalarTy,
-        f: F,
-    ) -> Word
-    where
-        F: FnOnce(&mut SPVBuilder, Word) -> Word,
-    {
-        *match ty {
-            ScalarTy::F32 => other.f32.get_or_insert_with(|| {
-                let id = *self.f32.get_or_insert_with(|| b.type_float(32));
-                f(b, id)
-            }),
-            ScalarTy::U32 => other.u32.get_or_insert_with(|| {
-                let id = *self.u32.get_or_insert_with(|| b.type_int(32, 0));
-                f(b, id)
-            }),
-            ScalarTy::S32 => other.s32.get_or_insert_with(|| {
-                let id = *self.s32.get_or_insert_with(|| b.type_int(32, 1));
-                f(b, id)
-            }),
         }
     }
 }
@@ -568,16 +646,15 @@ mod tests {
             ..Default::default()
         });
         let t1 = Ty::Vec(ScalarTy::F32, 3);
-        let t2 = ir
-            .make_type(CompositeTy::Pointer(t1, spirv::StorageClass::Function));
+        let t2 = ir.make_ptr_type(t1);
 
         let mut func = Function::new(None, Some(t1));
-        let a = func.make_argument(t1);
-        let b = func.make_argument(t1);
-        let a_plus_b = func.append_value_node(ValueNode::add(t1, a, b));
-        let c_var = func.make_variable(t2);
+        let a = func.make_argument(t1).into();
+        let b = func.make_argument(t1).into();
+        let a_plus_b = func.append_value_node(ValueNode::fadd(t1, a, b)).into();
+        let c_var = func.make_variable(t2, StorageClass::Function).into();
         func.append_node(Node::Store(c_var, a_plus_b));
-        let c = func.append_value_node(ValueNode::load(t1, c_var));
+        let c = func.append_value_node(ValueNode::load(t1, c_var)).into();
         func.return_value(c);
         ir.make_function(func);
 
