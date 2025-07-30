@@ -1,14 +1,19 @@
+pub mod constant;
+pub mod ty;
+
 use crate::l_base::{ScalarTy, TranslateFrom};
 
 use rspirv::dr::{Builder as SPVBuilder, Module as SPVModule};
 use rspirv::spirv::{self, StorageClass, Word};
 
+use constant::{Constant, ConstantId, ScalarConstant};
+use ty::{CompositeTy, CompositeTyId, PtrTyId, Ty};
+
 #[derive(Debug, Default, Clone)]
 pub struct IR {
     pub functions: Vec<Function>,
-    pub buffers: Vec<Buffer>,
-    pub blobs_data: Vec<u8>,
-    pub blobs: Vec<Blob>,
+    pub constants: Vec<Constant>,
+    pub uniforms: Vec<Uniform>,
     pub composite_types: Vec<CompositeTy>,
     pub ptr_types: Vec<Ty>,
     pub config: IRConfig,
@@ -24,12 +29,20 @@ pub struct Types<'a> {
 #[derive(Default, Debug, Clone)]
 pub struct IRConfig {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uniform {
+    pub ty: PtrTyId,
+    pub descriptor_set: u32,
+    pub binding: u32,
+    pub writable: bool,
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub name: Option<String>,
     pub ret: Option<Ty>,
     pub args: Vec<Ty>,
-    pub vars: Vec<(PtrTyId, StorageClass, Option<Value>)>,
+    pub vars: Vec<(PtrTyId, Option<Value>)>,
     pub body: Vec<Node>,
     pub value_nodes: Vec<ValueNode>,
 }
@@ -47,6 +60,8 @@ pub enum ValueNodeOp {
     Load(Value),
     IAdd(Value, Value),
     FAdd(Value, Value),
+    // TODO: Check for access chain validity
+    Access(Value, Box<[Value]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,52 +70,8 @@ pub struct ValueNode {
     pub op: ValueNodeOp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Buffer {
-    pub blob: Option<BlobId>,
-    pub ty: CompositeTyId,
-    pub layout: BufferLayout,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BufferLayout {
-    pub descriptor_set: Word,
-    pub binding: Word,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Blob {
-    pub start_idx: usize,
-    pub end_idx: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ty {
-    Scalar(ScalarTy),
-    Vec(ScalarTy, u32),
-    Mat(ScalarTy, u32),
-    Ptr(PtrTyId, StorageClass),
-    Composite(CompositeTyId),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompositeTy {
-    Array1(Ty, Option<usize>),
-    Array2(Ty, Option<usize>, usize),
-    Array3(Ty, Option<usize>, usize, usize),
-    ArrayN(Ty, Option<usize>, Vec<usize>),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionId(pub usize);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferId(pub usize);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlobId(pub usize);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompositeTyId(pub usize);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PtrTyId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueNodeId(pub usize);
 
@@ -109,12 +80,21 @@ pub struct Parameter(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Temporary(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Variable(pub usize);
+pub struct Private(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniformId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     Parameter(Parameter),
     Temporary(Temporary),
+    Constant(ConstantId),
     Variable(Variable),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variable {
+    Private(Private),
+    Uniform(UniformId),
 }
 
 impl From<Parameter> for Value {
@@ -135,6 +115,24 @@ impl From<Variable> for Value {
     }
 }
 
+impl From<Private> for Value {
+    fn from(v: Private) -> Self {
+        Value::Variable(Variable::Private(v))
+    }
+}
+
+impl From<UniformId> for Value {
+    fn from(v: UniformId) -> Self {
+        Value::Variable(Variable::Uniform(v))
+    }
+}
+
+impl From<ConstantId> for Value {
+    fn from(v: ConstantId) -> Self {
+        Value::Constant(v)
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     AssemblerError(rspirv::dr::Error),
@@ -147,12 +145,6 @@ pub enum Error {
 impl From<rspirv::dr::Error> for Error {
     fn from(e: rspirv::dr::Error) -> Self {
         Error::AssemblerError(e)
-    }
-}
-
-impl From<CompositeTyId> for Ty {
-    fn from(id: CompositeTyId) -> Self {
-        Ty::Composite(id)
     }
 }
 
@@ -173,6 +165,12 @@ struct LazyScalarTypeMapper {
     s32: Option<Word>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ShaderScope<'a> {
+    constants: &'a [Word],
+    uniforms: &'a [Word],
+}
+
 struct FunctionCompiler<'a> {
     type_mapper: &'a mut LazyTypeMapper,
     function: &'a Function,
@@ -181,12 +179,14 @@ struct FunctionCompiler<'a> {
     variable_ids: Box<[u32]>,
     value_ids: Vec<u32>,
     func_id: u32,
+    scope: ShaderScope<'a>,
 }
 
 impl TranslateFrom<IR> for SPVModule {
     type Error = Error;
     fn translate_from(ir: IR) -> Result<Self, Self::Error> {
         let mut b = SPVBuilder::new();
+        b.set_version(1, 0);
         b.capability(spirv::Capability::Shader);
         b.ext_inst_import("GLSL.std.450");
         b.source(
@@ -201,6 +201,57 @@ impl TranslateFrom<IR> for SPVModule {
         );
 
         let mut type_mapper = LazyTypeMapper::new(ir.types());
+
+        let uniform_ids = ir
+            .uniforms
+            .iter()
+            // TODO: Maybe put this in a declared function
+            .map(
+                |&Uniform {
+                     descriptor_set,
+                     binding,
+                     ty,
+                     writable,
+                 }| {
+                    let ty_id = type_mapper.get_ptr(
+                        &mut b,
+                        ir.types(),
+                        ty,
+                        StorageClass::Uniform,
+                    );
+                    // TODO: Decorate the variable, not the type.
+                    b.decorate(ty_id, spirv::Decoration::BufferBlock, []);
+                    b.decorate(
+                        ty_id,
+                        spirv::Decoration::DescriptorSet,
+                        [descriptor_set.into()],
+                    );
+                    b.decorate(
+                        ty_id,
+                        spirv::Decoration::Binding,
+                        [binding.into()],
+                    );
+                    if !writable {
+                        b.decorate(ty_id, spirv::Decoration::NonWritable, []);
+                    }
+                    b.variable(ty_id, None, StorageClass::Uniform, None)
+                },
+            )
+            .collect::<Box<[_]>>();
+
+        let constant_ids = ir
+            .constants
+            .iter()
+            .map(|c| match c {
+                &Constant::Scalar(ScalarConstant::U32(v)) => {
+                    let t =
+                        type_mapper.scalars.get(&mut b, ScalarTy::U32).into();
+                    b.constant_bit32(t, v)
+                }
+                _ => todo!(),
+            })
+            .collect::<Box<[_]>>();
+
         let mut spirv_functions = Vec::with_capacity(ir.functions.len());
 
         for i in 0..ir.functions.len() {
@@ -209,6 +260,10 @@ impl TranslateFrom<IR> for SPVModule {
                 &mut type_mapper,
                 &ir.functions[i],
                 &ir,
+                ShaderScope {
+                    uniforms: &uniform_ids,
+                    constants: &constant_ids,
+                },
             )?
             .compile(&mut b)?;
             spirv_functions.push(func_id);
@@ -257,6 +312,18 @@ impl IR {
         CompositeTyId(id)
     }
 
+    pub fn make_uniform(&mut self, uniform: Uniform) -> UniformId {
+        let id = self.uniforms.len();
+        self.uniforms.push(uniform);
+        UniformId(id)
+    }
+
+    pub fn make_constant(&mut self, constant: Constant) -> ConstantId {
+        let id = self.constants.len();
+        self.constants.push(constant);
+        ConstantId(id)
+    }
+
     pub fn make_function(&mut self, func: Function) -> FunctionId {
         let (id, _) = self.make_function_mut(func);
         id
@@ -270,12 +337,6 @@ impl IR {
         self.functions.push(func);
         let func = &mut self.functions[id];
         (FunctionId(id), func)
-    }
-
-    pub fn make_buffer(&mut self, buffer: Buffer) -> BufferId {
-        let id = self.buffers.len();
-        self.buffers.push(buffer);
-        BufferId(id)
     }
 
     pub fn entry_point(&mut self, func_id: FunctionId) {
@@ -298,14 +359,10 @@ impl Function {
         Parameter(id)
     }
 
-    pub fn make_variable(
-        &mut self,
-        ty: PtrTyId,
-        storage_class: StorageClass,
-    ) -> Variable {
+    pub fn make_variable(&mut self, ty: PtrTyId) -> Private {
         let id = self.vars.len();
-        self.vars.push((ty, storage_class, None));
-        Variable(id)
+        self.vars.push((ty, None));
+        Private(id)
     }
 
     pub fn append_node(&mut self, node: Node) {
@@ -363,10 +420,6 @@ impl Value {
     pub fn parameter(i: usize) -> Self {
         Value::Parameter(Parameter(i))
     }
-
-    pub fn variable(i: usize) -> Self {
-        Value::Variable(Variable(i))
-    }
 }
 
 impl<'a> FunctionCompiler<'a> {
@@ -375,6 +428,7 @@ impl<'a> FunctionCompiler<'a> {
         type_mapper: &'a mut LazyTypeMapper,
         func: &'a Function,
         ir: &'a IR,
+        scope: ShaderScope<'a>,
     ) -> Result<Self, rspirv::dr::Error> {
         let Function { ret: maybe_ret, .. } = func;
         let ret = maybe_ret
@@ -401,9 +455,13 @@ impl<'a> FunctionCompiler<'a> {
         let variable_ids = func
             .vars
             .iter()
-            .map(|&(ty, storage_class, _init)| {
-                let ty_id =
-                    type_mapper.get_ptr(b, ir.types(), ty, storage_class);
+            .map(|&(ty, _init)| {
+                let ty_id = type_mapper.get_ptr(
+                    b,
+                    ir.types(),
+                    ty,
+                    StorageClass::Function,
+                );
                 // let init = init.map(|init| b.variable(ty_id, None, StorageClass::Function, init));
                 b.variable(ty_id, None, StorageClass::Function, None)
             })
@@ -416,6 +474,7 @@ impl<'a> FunctionCompiler<'a> {
             value_ids: Vec::new(),
             parameter_ids,
             variable_ids,
+            scope,
         })
     }
 
@@ -423,7 +482,13 @@ impl<'a> FunctionCompiler<'a> {
         match v {
             Value::Parameter(Parameter(i)) => self.parameter_ids[i],
             Value::Temporary(Temporary(i)) => self.value_ids[i],
-            Value::Variable(Variable(i)) => self.variable_ids[i],
+            Value::Variable(Variable::Private(Private(i))) => {
+                self.variable_ids[i]
+            }
+            Value::Variable(Variable::Uniform(UniformId(i))) => {
+                self.scope.uniforms[i]
+            }
+            Value::Constant(ConstantId(i)) => self.scope.constants[i],
         }
     }
 
@@ -472,9 +537,10 @@ impl<'a> FunctionCompiler<'a> {
         match v {
             Value::Parameter(Parameter(i)) => self.function.args[i],
             Value::Temporary(Temporary(i)) => self.function.value_nodes[i].ty,
-            Value::Variable(Variable(i)) => {
+            Value::Variable(Variable::Private(Private(i))) => {
                 Ty::Ptr(self.function.vars[i].0, StorageClass::Function)
             }
+            _ => todo!(),
         }
     }
 
@@ -535,6 +601,21 @@ impl<'a> FunctionCompiler<'a> {
                 let id = b.load(ty_id, None, ptr_id, None, [])?;
                 self.value_ids.push(id);
             }
+
+            ValueNode {
+                ty,
+                op: Op::Access(base, chain),
+            } => {
+                let base = self.get_value(dbg!(*base));
+                let chain = chain
+                    .iter()
+                    .map(|v| self.get_value(*v))
+                    .collect::<Box<[_]>>();
+                let ty_id = self.type_mapper.get(b, self.types, ty);
+                dbg!((ty_id, base));
+                let id = b.access_chain(ty_id, None, base, chain)?;
+                self.value_ids.push(id);
+            }
         }
         Ok(())
     }
@@ -592,17 +673,36 @@ impl LazyTypeMapper {
 
     fn get_composite(
         &mut self,
-        _b: &mut SPVBuilder,
+        b: &mut SPVBuilder,
         types: Types<'_>,
         ty: CompositeTyId,
     ) -> Word {
         let CompositeTyId(i) = ty;
-        let ty = &types.composite[i];
-        let (is_found, id) = match self.composites[i] {
-            None => match ty {
-                _ => todo!(),
-            },
-            Some(id) => (true, id),
+        let (is_found, id) = match &self.composites[i] {
+            &Some(id) => (true, id),
+            None => (
+                false,
+                match &types.composite[i] {
+                    CompositeTy::Array1(ty, None) => {
+                        let base = self.get(b, types, ty);
+                        b.type_runtime_array(base)
+                    }
+                    CompositeTy::Array1(ty, Some(len)) => {
+                        let base = self.get(b, types, ty);
+                        let u32_id = self.scalars.get(b, ScalarTy::U32);
+                        let len = b.constant_bit32(u32_id, *len as u32);
+                        b.type_array(base, len)
+                    }
+                    // TODO: Decorate members
+                    CompositeTy::Struct(fields) => {
+                        let fields_ids = fields
+                            .iter()
+                            .map(|ty| self.get(b, types, ty))
+                            .collect::<Box<[_]>>();
+                        b.type_struct(fields_ids)
+                    }
+                },
+            ),
         };
         if !is_found {
             self.composites[i] = Some(id);
@@ -636,6 +736,8 @@ mod tests {
         process::{Command, Stdio},
     };
 
+    use crate::shader::l0::constant::ScalarConstant;
+
     use super::*;
 
     use rspirv::binary::{Assemble, Disassemble};
@@ -645,25 +747,64 @@ mod tests {
         let mut ir = IR::new(IRConfig {
             ..Default::default()
         });
-        let t1 = Ty::Vec(ScalarTy::F32, 3);
-        let t2 = ir.make_ptr_type(t1);
+        let t0 = Ty::Scalar(ScalarTy::F32);
+        let t1 = ir.make_composite_type(CompositeTy::Array1(t0, None)).into();
+        let t2 = ir.make_composite_type(CompositeTy::Struct(Box::new([t1])));
+        let t3 = ir.make_ptr_type(t2.into());
+        let t4 = ir.make_ptr_type(t0);
 
-        let mut func = Function::new(None, Some(t1));
-        let a = func.make_argument(t1).into();
-        let b = func.make_argument(t1).into();
-        let a_plus_b = func.append_value_node(ValueNode::fadd(t1, a, b)).into();
-        let c_var = func.make_variable(t2, StorageClass::Function).into();
-        func.append_node(Node::Store(c_var, a_plus_b));
-        let c = func.append_value_node(ValueNode::load(t1, c_var)).into();
-        func.return_value(c);
-        ir.make_function(func);
+        let u32_0 = ir
+            .make_constant(Constant::Scalar(ScalarConstant::U32(0)))
+            .into();
 
-        let main_func = ir.make_function(Function {
-            ret: None,
-            name: Some("main".into()),
-            body: vec![Node::Return],
-            ..Default::default()
+        let inputs = [0, 1]
+            .into_iter()
+            .map(|binding| {
+                ir.make_uniform(Uniform {
+                    ty: t3,
+                    descriptor_set: 0,
+                    binding,
+                    writable: false,
+                })
+            })
+            .collect::<Box<[_]>>();
+        let output = ir.make_uniform(Uniform {
+            ty: t3,
+            descriptor_set: 0,
+            binding: 2,
+            writable: true,
         });
+
+        let mut main = Function::new(Some("main".into()), None);
+        let [a, b] = &inputs
+            .iter()
+            .map(|&input| {
+                let ptr_id = main.append_value_node(ValueNode {
+                    ty: Ty::Ptr(t4, StorageClass::Uniform),
+                    op: ValueNodeOp::Access(
+                        input.into(),
+                        Box::new([u32_0, u32_0]),
+                    ),
+                });
+                main.append_value_node(ValueNode::load(t0, ptr_id.into()))
+                    .into()
+            })
+            .collect::<Box<[_]>>()[..]
+        else {
+            panic!("goofy ahh")
+        };
+        let output_value = main.append_value_node(ValueNode::fadd(t0, *a, *b));
+        let output_access = main.append_value_node(ValueNode {
+            ty: Ty::Ptr(t4, StorageClass::Uniform),
+            op: ValueNodeOp::Access(output.into(), Box::new([u32_0, u32_0])),
+        });
+        main.append_node(Node::Store(
+            output_access.into(),
+            output_value.into(),
+        ));
+        main.append_node(Node::Return);
+
+        let main_func = ir.make_function(main);
         ir.entry_point(main_func);
 
         let module = SPVModule::translate_from(ir).unwrap();
