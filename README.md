@@ -5,4 +5,4 @@ A compiler that translates ONNX machine learning models to Vulkan compute shader
 
 # Internal architecture
 
-![Processing diagram](Diagram.jpg)
+![Processing diagram](docs/Diagram.jpg)

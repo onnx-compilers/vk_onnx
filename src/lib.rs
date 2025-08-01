@@ -8,3 +8,4 @@ pub mod l0;
 pub mod l1;
 // pub mod codegen;
 pub mod shader;
+pub mod pipeline;

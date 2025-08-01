@@ -29,6 +29,8 @@ pub struct Types<'a> {
 #[derive(Default, Debug, Clone)]
 pub struct IRConfig {
     pub local_size: [u32; 3],
+    // TODO: Fill this in Default::default() instead of using an option
+    pub version: Option<(u8, u8)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +199,11 @@ impl TranslateFrom<IR> for SPVModule {
     type Error = Error;
     fn translate_from(ir: IR) -> Result<Self, Self::Error> {
         let mut b = SPVBuilder::new();
+        let (major, minor) = ir
+            .config
+            .version
+            .unwrap_or((spirv::MAJOR_VERSION, spirv::MINOR_VERSION));
+        b.set_version(major, minor);
         b.capability(spirv::Capability::Shader);
         b.ext_inst_import("GLSL.std.450");
         b.source(
@@ -243,7 +250,9 @@ impl TranslateFrom<IR> for SPVModule {
                         ty,
                         StorageClass::StorageBuffer,
                     );
-                    // TODO: Decorate the variable, not the type.
+                    let base_ty = &ir.ptr_types[ty.0];
+                    let base_ty_id = type_mapper.get(&mut b, ir.types(), &constant_ids, base_ty);
+                    b.decorate(base_ty_id, spirv::Decoration::Block, []);
                     let id = b.variable(
                         ty_id,
                         None,
@@ -905,24 +914,11 @@ impl LazyScalarTypeMapper {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-    };
-
-    use crate::shader::l0::constant::ScalarConstant;
-
+pub mod test_utils {
     use super::*;
 
-    use rspirv::binary::{Assemble, Disassemble};
-
-    #[test]
-    fn test() {
-        let mut ir = IR::new(IRConfig {
-            local_size: [1, 1, 1],
-            ..Default::default()
-        });
+    pub fn make_module(config: IRConfig) -> SPVModule {
+        let mut ir = IR::new(config);
         let t0 = Ty::Scalar(ScalarTy::F32);
         let t0_ptr = ir.make_ptr_type(t0);
         let t0_rt_array =
@@ -990,11 +986,28 @@ mod tests {
             [inputs[0].into(), inputs[1].into(), output.into()],
         );
 
-        let module = SPVModule::translate_from(ir).unwrap();
+        SPVModule::translate_from(ir).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    use super::*;
+
+    use rspirv::binary::{Assemble, Disassemble};
+
+    #[test]
+    fn test() {
+        let module = test_utils::make_module(Default::default());
         eprintln!("{}", module.disassemble());
         let raw = module.assemble();
         assert_ne!(raw.len(), 0);
-        //
+
         // to make sure it's actually valid
         let mut loader = rspirv::dr::Loader::new();
         let () =
