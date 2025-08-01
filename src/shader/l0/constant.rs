@@ -15,14 +15,14 @@ pub enum ScalarConstant {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompositeConstant {
-    Aggregate(AggregateConstant),
+    Aggregate(Aggregate<Constant>),
     Vec(Box<[ScalarConstant]>),
     Mat(Box<[ScalarConstant]>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AggregateConstant {
-    Array(CompositeTyId, Box<[Constant]>),
+pub enum Aggregate<T> {
+    Array(CompositeTyId, Box<[T]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,8 +52,8 @@ impl From<CompositeConstant> for Constant {
     }
 }
 
-impl From<AggregateConstant> for Constant {
-    fn from(v: AggregateConstant) -> Self {
+impl From<Aggregate<Constant>> for Constant {
+    fn from(v: Aggregate<Constant>) -> Self {
         Constant::Composite(CompositeConstant::Aggregate(v))
     }
 }

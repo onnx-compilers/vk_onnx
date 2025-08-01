@@ -7,17 +7,17 @@ use rspirv::dr::{Builder as SPVBuilder, Module as SPVModule};
 use rspirv::spirv::{self, StorageClass, Word};
 
 use constant::{Constant, ConstantId, ScalarConstant};
-use ty::{CompositeTy, CompositeTyId, PtrTyId, Ty};
+use ty::{CompositeTy, CompositeTyId, PtrTyId, StructMember, Ty};
 
 #[derive(Debug, Default, Clone)]
 pub struct IR {
     pub functions: Vec<Function>,
     pub constants: Vec<Constant>,
-    pub uniforms: Vec<Uniform>,
+    pub storage_buffers: Vec<StorageBuffer>,
     pub composite_types: Vec<CompositeTy>,
     pub ptr_types: Vec<Ty>,
     pub config: IRConfig,
-    pub entry_point: Option<FunctionId>,
+    pub entry_point: Option<(FunctionId, Box<[Variable]>)>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -27,10 +27,12 @@ pub struct Types<'a> {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct IRConfig {}
+pub struct IRConfig {
+    pub local_size: [u32; 3],
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Uniform {
+pub struct StorageBuffer {
     pub ty: PtrTyId,
     pub descriptor_set: u32,
     pub binding: u32,
@@ -82,7 +84,7 @@ pub struct Temporary(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Private(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UniformId(pub usize);
+pub struct StorageBufferId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     Parameter(Parameter),
@@ -94,7 +96,7 @@ pub enum Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variable {
     Private(Private),
-    Uniform(UniformId),
+    StorageBuffer(StorageBufferId),
 }
 
 impl From<Parameter> for Value {
@@ -121,15 +123,21 @@ impl From<Private> for Value {
     }
 }
 
-impl From<UniformId> for Value {
-    fn from(v: UniformId) -> Self {
-        Value::Variable(Variable::Uniform(v))
+impl From<StorageBufferId> for Value {
+    fn from(v: StorageBufferId) -> Self {
+        Value::Variable(Variable::StorageBuffer(v))
     }
 }
 
 impl From<ConstantId> for Value {
     fn from(v: ConstantId) -> Self {
         Value::Constant(v)
+    }
+}
+
+impl From<StorageBufferId> for Variable {
+    fn from(v: StorageBufferId) -> Self {
+        Variable::StorageBuffer(v)
     }
 }
 
@@ -143,8 +151,8 @@ pub enum Error {
 }
 
 impl From<rspirv::dr::Error> for Error {
-    fn from(e: rspirv::dr::Error) -> Self {
-        Error::AssemblerError(e)
+    fn from(error: rspirv::dr::Error) -> Self {
+        Error::AssemblerError(error)
     }
 }
 
@@ -168,13 +176,14 @@ struct LazyScalarTypeMapper {
 #[derive(Debug, Clone, Copy)]
 struct ShaderScope<'a> {
     constants: &'a [Word],
-    uniforms: &'a [Word],
+    storage_buffers: &'a [Word],
 }
 
 struct FunctionCompiler<'a> {
     type_mapper: &'a mut LazyTypeMapper,
+    constant_ids: &'a [Word],
     function: &'a Function,
-    types: Types<'a>,
+    ir_types: Types<'a>,
     parameter_ids: Box<[u32]>,
     variable_ids: Box<[u32]>,
     value_ids: Vec<u32>,
@@ -182,11 +191,12 @@ struct FunctionCompiler<'a> {
     scope: ShaderScope<'a>,
 }
 
+pub struct CompiledModule(pub Vec<Word>);
+
 impl TranslateFrom<IR> for SPVModule {
     type Error = Error;
     fn translate_from(ir: IR) -> Result<Self, Self::Error> {
         let mut b = SPVBuilder::new();
-        b.set_version(1, 0);
         b.capability(spirv::Capability::Shader);
         b.ext_inst_import("GLSL.std.450");
         b.source(
@@ -202,54 +212,60 @@ impl TranslateFrom<IR> for SPVModule {
 
         let mut type_mapper = LazyTypeMapper::new(ir.types());
 
-        let uniform_ids = ir
-            .uniforms
+        let mut constant_ids = Vec::with_capacity(ir.constants.len());
+        for c in ir.constants.iter() {
+            let id = match c {
+                &Constant::Scalar(ScalarConstant::U32(v)) => {
+                    let t = type_mapper.scalars.get_u32(&mut b);
+                    b.constant_bit32(t, v)
+                }
+                _ => todo!(),
+            };
+            constant_ids.push(id);
+        }
+        let constant_ids = constant_ids.into_boxed_slice();
+
+        let storage_buffer_ids = ir
+            .storage_buffers
             .iter()
             // TODO: Maybe put this in a declared function
             .map(
-                |&Uniform {
+                |&StorageBuffer {
                      descriptor_set,
                      binding,
                      ty,
-                     writable,
+                     .. // writable,
                  }| {
                     let ty_id = type_mapper.get_ptr(
                         &mut b,
                         ir.types(),
+                        &constant_ids,
                         ty,
-                        StorageClass::Uniform,
+                        StorageClass::StorageBuffer,
                     );
                     // TODO: Decorate the variable, not the type.
-                    b.decorate(ty_id, spirv::Decoration::BufferBlock, []);
-                    b.decorate(
+                    let id = b.variable(
                         ty_id,
+                        None,
+                        StorageClass::StorageBuffer,
+                        None,
+                    );
+                    b.decorate(
+                        id,
                         spirv::Decoration::DescriptorSet,
                         [descriptor_set.into()],
                     );
                     b.decorate(
-                        ty_id,
+                        id,
                         spirv::Decoration::Binding,
                         [binding.into()],
                     );
-                    if !writable {
-                        b.decorate(ty_id, spirv::Decoration::NonWritable, []);
-                    }
-                    b.variable(ty_id, None, StorageClass::Uniform, None)
+                    // if !writable {
+                    //     b.decorate(id, spirv::Decoration::NonWritable, []);
+                    // }
+                    id
                 },
             )
-            .collect::<Box<[_]>>();
-
-        let constant_ids = ir
-            .constants
-            .iter()
-            .map(|c| match c {
-                &Constant::Scalar(ScalarConstant::U32(v)) => {
-                    let t =
-                        type_mapper.scalars.get(&mut b, ScalarTy::U32).into();
-                    b.constant_bit32(t, v)
-                }
-                _ => todo!(),
-            })
             .collect::<Box<[_]>>();
 
         let mut spirv_functions = Vec::with_capacity(ir.functions.len());
@@ -258,10 +274,11 @@ impl TranslateFrom<IR> for SPVModule {
             let func_id = FunctionCompiler::new(
                 &mut b,
                 &mut type_mapper,
+                &constant_ids,
                 &ir.functions[i],
                 &ir,
                 ShaderScope {
-                    uniforms: &uniform_ids,
+                    storage_buffers: &storage_buffer_ids,
                     constants: &constant_ids,
                 },
             )?
@@ -269,7 +286,7 @@ impl TranslateFrom<IR> for SPVModule {
             spirv_functions.push(func_id);
         }
 
-        if let Some(FunctionId(i)) = ir.entry_point {
+        if let Some((FunctionId(i), variables)) = ir.entry_point {
             b.entry_point(
                 spirv::ExecutionModel::GLCompute,
                 spirv_functions[i],
@@ -277,7 +294,21 @@ impl TranslateFrom<IR> for SPVModule {
                     .get(i)
                     .and_then(|f| f.name.clone())
                     .ok_or(Error::MissingEntrypoinName)?,
-                &[],
+                variables
+                    .into_iter()
+                    .map(|v| match v {
+                        Variable::StorageBuffer(StorageBufferId(i)) => {
+                            storage_buffer_ids[i]
+                        }
+                        _ => todo!(),
+                    })
+                    .collect::<Box<[_]>>(),
+            );
+
+            b.execution_mode(
+                spirv_functions[i],
+                spirv::ExecutionMode::LocalSize,
+                &ir.config.local_size,
             );
         }
 
@@ -312,10 +343,13 @@ impl IR {
         CompositeTyId(id)
     }
 
-    pub fn make_uniform(&mut self, uniform: Uniform) -> UniformId {
-        let id = self.uniforms.len();
-        self.uniforms.push(uniform);
-        UniformId(id)
+    pub fn make_storage_buffer(
+        &mut self,
+        storage_buffer: StorageBuffer,
+    ) -> StorageBufferId {
+        let id = self.storage_buffers.len();
+        self.storage_buffers.push(storage_buffer);
+        StorageBufferId(id)
     }
 
     pub fn make_constant(&mut self, constant: Constant) -> ConstantId {
@@ -339,8 +373,12 @@ impl IR {
         (FunctionId(id), func)
     }
 
-    pub fn entry_point(&mut self, func_id: FunctionId) {
-        self.entry_point = Some(func_id);
+    pub fn entry_point(
+        &mut self,
+        func_id: FunctionId,
+        variables: impl Into<Box<[Variable]>>,
+    ) {
+        self.entry_point = Some((func_id, variables.into()));
     }
 }
 
@@ -411,6 +449,18 @@ impl ValueNode {
     pub fn load(ty: Ty, a: Value) -> Self {
         Self::new(ty, ValueNodeOp::Load(a))
     }
+
+    pub fn access(
+        ty: PtrTyId,
+        storage_class: StorageClass,
+        base: Value,
+        chain: impl Into<Box<[Value]>>,
+    ) -> Self {
+        Self::new(
+            Ty::Ptr(ty, storage_class),
+            ValueNodeOp::Access(base, chain.into()),
+        )
+    }
 }
 
 impl Value {
@@ -426,18 +476,19 @@ impl<'a> FunctionCompiler<'a> {
     pub fn new(
         b: &mut SPVBuilder,
         type_mapper: &'a mut LazyTypeMapper,
+        constant_ids: &'a [Word],
         func: &'a Function,
         ir: &'a IR,
         scope: ShaderScope<'a>,
     ) -> Result<Self, rspirv::dr::Error> {
         let Function { ret: maybe_ret, .. } = func;
         let ret = maybe_ret
-            .map(|ret| type_mapper.get(b, ir.types(), &ret))
+            .map(|ret| type_mapper.get(b, ir.types(), constant_ids, &ret))
             .unwrap_or_else(|| type_mapper.get_void(b));
         let args = func
             .args
             .iter()
-            .map(|ty| type_mapper.get(b, ir.types(), &ty))
+            .map(|ty| type_mapper.get(b, ir.types(), constant_ids, &ty))
             .collect::<Box<[_]>>();
         let func_ty_id = b.type_function(ret, args.clone());
         let func_id = b.begin_function(
@@ -459,6 +510,7 @@ impl<'a> FunctionCompiler<'a> {
                 let ty_id = type_mapper.get_ptr(
                     b,
                     ir.types(),
+                    constant_ids,
                     ty,
                     StorageClass::Function,
                 );
@@ -468,8 +520,9 @@ impl<'a> FunctionCompiler<'a> {
             .collect();
         Ok(FunctionCompiler {
             type_mapper,
+            constant_ids,
             function: func,
-            types: ir.types(),
+            ir_types: ir.types(),
             func_id,
             value_ids: Vec::new(),
             parameter_ids,
@@ -485,8 +538,8 @@ impl<'a> FunctionCompiler<'a> {
             Value::Variable(Variable::Private(Private(i))) => {
                 self.variable_ids[i]
             }
-            Value::Variable(Variable::Uniform(UniformId(i))) => {
-                self.scope.uniforms[i]
+            Value::Variable(Variable::StorageBuffer(StorageBufferId(i))) => {
+                self.scope.storage_buffers[i]
             }
             Value::Constant(ConstantId(i)) => self.scope.constants[i],
         }
@@ -516,7 +569,7 @@ impl<'a> FunctionCompiler<'a> {
                 if let None = self.function.ret {
                     return Err(Error::ReturnInVoid);
                 } else if let Some(ret) = self.function.ret {
-                    if !ty.same_as(&ret, self.types) {
+                    if !ty.same_as(&ret, self.ir_types) {
                         return Err(Error::ReturnTypeMismatch(ty.clone()));
                     }
                 }
@@ -558,7 +611,12 @@ impl<'a> FunctionCompiler<'a> {
                 let lhs = self.get_value(*lhs);
                 let rhs = self.get_value(*rhs);
                 // TODO: Check type compatibility for operation
-                let ty_id = self.type_mapper.get(b, self.types, ty);
+                let ty_id = self.type_mapper.get(
+                    b,
+                    self.ir_types,
+                    self.constant_ids,
+                    ty,
+                );
                 let inner_ty = match ty {
                     &Ty::Scalar(ty) => ty,
                     &Ty::Vec(ty, _n) => ty,
@@ -578,7 +636,12 @@ impl<'a> FunctionCompiler<'a> {
                 let lhs = self.get_value(*lhs);
                 let rhs = self.get_value(*rhs);
                 // TODO: Check type compatibility for operation
-                let ty_id = self.type_mapper.get(b, self.types, ty);
+                let ty_id = self.type_mapper.get(
+                    b,
+                    self.ir_types,
+                    self.constant_ids,
+                    ty,
+                );
                 let inner_ty = match ty {
                     &Ty::Scalar(ty) => ty,
                     &Ty::Vec(ty, _n) => ty,
@@ -596,7 +659,12 @@ impl<'a> FunctionCompiler<'a> {
                 op: Op::Load(ptr),
             } => {
                 // TODO: Type checking perhaps
-                let ty_id = self.type_mapper.get(b, self.types, ty);
+                let ty_id = self.type_mapper.get(
+                    b,
+                    self.ir_types,
+                    self.constant_ids,
+                    ty,
+                );
                 let ptr_id = self.get_value(*ptr);
                 let id = b.load(ty_id, None, ptr_id, None, [])?;
                 self.value_ids.push(id);
@@ -606,13 +674,17 @@ impl<'a> FunctionCompiler<'a> {
                 ty,
                 op: Op::Access(base, chain),
             } => {
-                let base = self.get_value(dbg!(*base));
+                let base = self.get_value(*base);
                 let chain = chain
                     .iter()
                     .map(|v| self.get_value(*v))
                     .collect::<Box<[_]>>();
-                let ty_id = self.type_mapper.get(b, self.types, ty);
-                dbg!((ty_id, base));
+                let ty_id = self.type_mapper.get(
+                    b,
+                    self.ir_types,
+                    self.constant_ids,
+                    ty,
+                );
                 let id = b.access_chain(ty_id, None, base, chain)?;
                 self.value_ids.push(id);
             }
@@ -630,7 +702,13 @@ impl LazyTypeMapper {
         }
     }
 
-    fn get(&mut self, b: &mut SPVBuilder, types: Types<'_>, ty: &Ty) -> Word {
+    fn get(
+        &mut self,
+        b: &mut SPVBuilder,
+        ir_types: Types<'_>,
+        constants: &[Word],
+        ty: &Ty,
+    ) -> Word {
         match ty {
             &Ty::Scalar(ty) => self.scalars.get(b, ty),
             &Ty::Vec(ty, n) => *self.vectors[n as usize - 2]
@@ -646,23 +724,26 @@ impl LazyTypeMapper {
                     b.type_matrix(base, n)
                 }),
             &Ty::Ptr(ty, storage_class) => {
-                self.get_ptr(b, types, ty, storage_class)
+                self.get_ptr(b, ir_types, constants, ty, storage_class)
             }
-            &Ty::Composite(ty) => self.get_composite(b, types, ty),
+            &Ty::Composite(ty) => {
+                self.get_composite(b, ir_types, constants, ty)
+            }
         }
     }
 
     fn get_ptr(
         &mut self,
         b: &mut SPVBuilder,
-        types: Types<'_>,
+        ir_types: Types<'_>,
+        constants: &[Word],
         ptr_ty: PtrTyId,
         storage_class: StorageClass,
     ) -> Word {
-        let Some(ty) = types.ptr.get(ptr_ty.0) else {
+        let Some(ty) = ir_types.ptr.get(ptr_ty.0) else {
             unreachable!()
         };
-        let base = self.get(b, types, ty);
+        let base = self.get(b, ir_types, constants, ty);
         *self.ptrs[ptr_ty.0]
             .get_or_insert_with(|| b.type_pointer(None, storage_class, base))
     }
@@ -674,7 +755,8 @@ impl LazyTypeMapper {
     fn get_composite(
         &mut self,
         b: &mut SPVBuilder,
-        types: Types<'_>,
+        ir_types: Types<'_>,
+        constants: &[Word],
         ty: CompositeTyId,
     ) -> Word {
         let CompositeTyId(i) = ty;
@@ -682,31 +764,112 @@ impl LazyTypeMapper {
             &Some(id) => (true, id),
             None => (
                 false,
-                match &types.composite[i] {
-                    CompositeTy::Array1(ty, None) => {
-                        let base = self.get(b, types, ty);
-                        b.type_runtime_array(base)
-                    }
-                    CompositeTy::Array1(ty, Some(len)) => {
-                        let base = self.get(b, types, ty);
-                        let u32_id = self.scalars.get(b, ScalarTy::U32);
-                        let len = b.constant_bit32(u32_id, *len as u32);
-                        b.type_array(base, len)
-                    }
-                    // TODO: Decorate members
-                    CompositeTy::Struct(fields) => {
-                        let fields_ids = fields
-                            .iter()
-                            .map(|ty| self.get(b, types, ty))
-                            .collect::<Box<[_]>>();
-                        b.type_struct(fields_ids)
-                    }
-                },
+                self.make_composite(
+                    b,
+                    ir_types,
+                    constants,
+                    &ir_types.composite[i],
+                ),
             ),
         };
         if !is_found {
             self.composites[i] = Some(id);
         }
+        id
+    }
+
+    fn make_composite(
+        &mut self,
+        b: &mut SPVBuilder,
+        ir_types: Types<'_>,
+        constants: &[Word],
+        ty: &CompositeTy,
+    ) -> Word {
+        match ty {
+            CompositeTy::Array1(ty, None) => {
+                self.make_runtime_array1(b, ir_types, constants, ty)
+            }
+            &CompositeTy::Array1(ref ty, Some(len)) => {
+                self.make_array1(b, ir_types, constants, ty, len)
+            }
+            CompositeTy::Struct(fields) => {
+                self.make_struct(b, ir_types, constants, fields)
+            }
+        }
+    }
+
+    fn make_array1(
+        &mut self,
+        b: &mut SPVBuilder,
+        ir_types: Types<'_>,
+        constants: &[Word],
+        elem_ty: &Ty,
+        ConstantId(len_idx): ConstantId,
+    ) -> Word {
+        let base = self.get(b, ir_types, constants, elem_ty);
+        let len = constants[len_idx];
+        let id = b.type_array(base, len);
+        // TODO: Array stride
+        // b.decorate(id, spirv::Decoration::ArrayStride, );
+        id
+    }
+
+    fn make_runtime_array1(
+        &mut self,
+        b: &mut SPVBuilder,
+        ir_types: Types<'_>,
+        constants: &[Word],
+        elem_ty: &Ty,
+    ) -> Word {
+        let base = self.get(b, ir_types, constants, elem_ty);
+        let id = b.type_runtime_array(base);
+        // HACK: calculate type sizes for strides or annotate array types
+        let stride = 4;
+        b.decorate(
+            id,
+            spirv::Decoration::ArrayStride,
+            [rspirv::dr::Operand::LiteralBit32(stride)],
+        );
+        id
+    }
+
+    fn make_struct(
+        &mut self,
+        b: &mut SPVBuilder,
+        ir_types: Types<'_>,
+        constants: &[Word],
+        fields: &[StructMember],
+    ) -> Word {
+        let field_ids = fields
+            .iter()
+            .map(|StructMember { ty, .. }| self.get(b, ir_types, constants, ty))
+            .collect::<Box<[_]>>();
+        let id = b.id();
+        let id = b.type_struct_id(Some(id), field_ids);
+        // TODO: Maybe use this as the size
+        let _ = fields.iter().enumerate().fold(
+            0,
+            |offset, (i, &StructMember { writable, .. })| {
+                let i = i as u32;
+                if !writable {
+                    b.member_decorate(
+                        id,
+                        i,
+                        spirv::Decoration::NonWritable,
+                        [],
+                    );
+                }
+                // HACK: calculate type sizes
+                let member_size = 4;
+                b.member_decorate(
+                    id,
+                    i,
+                    spirv::Decoration::Offset,
+                    [rspirv::dr::Operand::LiteralBit32(offset)],
+                );
+                offset + member_size
+            },
+        );
         id
     }
 }
@@ -721,11 +884,23 @@ impl LazyScalarTypeMapper {
     }
 
     fn get(&mut self, b: &mut SPVBuilder, ty: ScalarTy) -> Word {
-        *match ty {
-            ScalarTy::F32 => self.f32.get_or_insert_with(|| b.type_float(32)),
-            ScalarTy::U32 => self.u32.get_or_insert_with(|| b.type_int(32, 0)),
-            ScalarTy::S32 => self.s32.get_or_insert_with(|| b.type_int(32, 1)),
+        match ty {
+            ScalarTy::F32 => self.get_f32(b),
+            ScalarTy::U32 => self.get_u32(b),
+            ScalarTy::S32 => self.get_s32(b),
         }
+    }
+
+    fn get_f32(&mut self, b: &mut SPVBuilder) -> Word {
+        *self.f32.get_or_insert_with(|| b.type_float(32))
+    }
+
+    fn get_u32(&mut self, b: &mut SPVBuilder) -> Word {
+        *self.u32.get_or_insert_with(|| b.type_int(32, 0))
+    }
+
+    fn get_s32(&mut self, b: &mut SPVBuilder) -> Word {
+        *self.s32.get_or_insert_with(|| b.type_int(32, 1))
     }
 }
 
@@ -745,59 +920,64 @@ mod tests {
     #[test]
     fn test() {
         let mut ir = IR::new(IRConfig {
+            local_size: [1, 1, 1],
             ..Default::default()
         });
         let t0 = Ty::Scalar(ScalarTy::F32);
-        let t1 = ir.make_composite_type(CompositeTy::Array1(t0, None)).into();
-        let t2 = ir.make_composite_type(CompositeTy::Struct(Box::new([t1])));
-        let t3 = ir.make_ptr_type(t2.into());
-        let t4 = ir.make_ptr_type(t0);
+        let t0_ptr = ir.make_ptr_type(t0);
+        let t0_rt_array =
+            ir.make_composite_type(CompositeTy::Array1(t0, None)).into();
+        let t2_input =
+            ir.make_composite_type(CompositeTy::r#struct([StructMember {
+                ty: t0_rt_array,
+                writable: false,
+            }]));
+        let t2_output =
+            ir.make_composite_type(CompositeTy::r#struct([StructMember {
+                ty: t0_rt_array,
+                writable: true,
+            }]));
+        let t3_input = ir.make_ptr_type(t2_input.into());
+        let t3_output = ir.make_ptr_type(t2_output.into());
 
         let u32_0 = ir
             .make_constant(Constant::Scalar(ScalarConstant::U32(0)))
             .into();
 
-        let inputs = [0, 1]
-            .into_iter()
-            .map(|binding| {
-                ir.make_uniform(Uniform {
-                    ty: t3,
-                    descriptor_set: 0,
-                    binding,
-                    writable: false,
-                })
+        let inputs = [0, 1].map(|binding| {
+            ir.make_storage_buffer(StorageBuffer {
+                ty: t3_input,
+                descriptor_set: 0,
+                binding,
+                writable: false,
             })
-            .collect::<Box<[_]>>();
-        let output = ir.make_uniform(Uniform {
-            ty: t3,
+        });
+        let output = ir.make_storage_buffer(StorageBuffer {
+            ty: t3_output,
             descriptor_set: 0,
             binding: 2,
             writable: true,
         });
 
         let mut main = Function::new(Some("main".into()), None);
-        let [a, b] = &inputs
-            .iter()
-            .map(|&input| {
-                let ptr_id = main.append_value_node(ValueNode {
-                    ty: Ty::Ptr(t4, StorageClass::Uniform),
-                    op: ValueNodeOp::Access(
-                        input.into(),
-                        Box::new([u32_0, u32_0]),
-                    ),
-                });
-                main.append_value_node(ValueNode::load(t0, ptr_id.into()))
-                    .into()
-            })
-            .collect::<Box<[_]>>()[..]
-        else {
-            panic!("goofy ahh")
-        };
-        let output_value = main.append_value_node(ValueNode::fadd(t0, *a, *b));
-        let output_access = main.append_value_node(ValueNode {
-            ty: Ty::Ptr(t4, StorageClass::Uniform),
-            op: ValueNodeOp::Access(output.into(), Box::new([u32_0, u32_0])),
+        let [a, b] = inputs.map(|input| {
+            let ptr_id = main.append_value_node(ValueNode::access(
+                t0_ptr,
+                StorageClass::StorageBuffer,
+                input.into(),
+                [u32_0, u32_0],
+            ));
+            main.append_value_node(ValueNode::load(t0, ptr_id.into()))
         });
+
+        let output_value =
+            main.append_value_node(ValueNode::fadd(t0, a.into(), b.into()));
+        let output_access = main.append_value_node(ValueNode::access(
+            t0_ptr,
+            StorageClass::StorageBuffer,
+            output.into(),
+            [u32_0, u32_0],
+        ));
         main.append_node(Node::Store(
             output_access.into(),
             output_value.into(),
@@ -805,7 +985,10 @@ mod tests {
         main.append_node(Node::Return);
 
         let main_func = ir.make_function(main);
-        ir.entry_point(main_func);
+        ir.entry_point(
+            main_func,
+            [inputs[0].into(), inputs[1].into(), output.into()],
+        );
 
         let module = SPVModule::translate_from(ir).unwrap();
         eprintln!("{}", module.disassemble());

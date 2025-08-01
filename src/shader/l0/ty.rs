@@ -2,6 +2,8 @@ use crate::l_base::ScalarTy;
 
 use rspirv::spirv::StorageClass;
 
+use super::constant::ConstantId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     Scalar(ScalarTy),
@@ -13,11 +15,17 @@ pub enum Ty {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositeTy {
-    Array1(Ty, Option<usize>),
+    Array1(Ty, Option<ConstantId>),
     // Array2(Ty, Option<usize>, usize),
     // Array3(Ty, Option<usize>, usize, usize),
     // ArrayN(Ty, Option<usize>, Box<[usize]>),
-    Struct(Box<[Ty]>),
+    Struct(Box<[StructMember]>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructMember {
+    pub ty: Ty,
+    pub writable: bool
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,5 +37,11 @@ pub struct CompositeTyId(pub usize);
 impl From<CompositeTyId> for Ty {
     fn from(id: CompositeTyId) -> Self {
         Ty::Composite(id)
+    }
+}
+
+impl CompositeTy {
+    pub fn r#struct(members: impl Into<Box<[StructMember]>>) -> Self {
+        Self::Struct(members.into())
     }
 }

@@ -2,7 +2,7 @@
 
 layout (local_size_x = 0x100) in;
 
-layout (set = 0, binding = 1) uniform Config {
+layout (set = 0, binding = 0) uniform Config {
   int size;
 } config;
 
@@ -30,6 +30,7 @@ void main() {
   if (gID < config.size) {
     outputC.values[gID] = c;
   }
+  int abc[] = {a, b, c};
 }
 
 int add(const int a, const int b) {
