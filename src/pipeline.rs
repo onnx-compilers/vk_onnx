@@ -93,7 +93,7 @@ impl From<IntoPipelineLayoutCreateInfoError> for CreateError {
 #[derive(BufferContents)]
 #[repr(C)]
 struct IOBuffer {
-    data: [f32; 1],
+    data: [f32; 2],
 }
 
 impl Pipeline {
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn test() {
         let module = crate::shader::l0::test_utils::make_module(IRConfig {
-            local_size: [1, 1, 1],
+            local_size: [2, 1, 1],
             version: Some((1, 3)),
             ..Default::default()
         });
@@ -270,7 +270,9 @@ mod tests {
             let mut a = buf_a.write().unwrap();
             let mut b = buf_b.write().unwrap();
             a.data[0] = 12.5;
+            a.data[1] = 0.0;
             b.data[0] = 5.4;
+            b.data[1] = 1.0;
         }
         pipeline.run();
         {
@@ -278,7 +280,7 @@ mod tests {
                 Into::<Subbuffer<[u8]>>::into(pipeline.buffers[2].clone())
                     .reinterpret::<IOBuffer>();
             let c = buf_c.read().unwrap();
-            assert_eq!(dbg!(c.data[0]), 17.9);
+            assert_eq!(dbg!(c.data), [17.9, 1.0]);
         }
     }
 }

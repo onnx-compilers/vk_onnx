@@ -14,8 +14,9 @@ pub struct IR {
     pub functions: Vec<Function>,
     pub constants: Vec<Constant>,
     pub storage_buffers: Vec<StorageBuffer>,
+    pub builtins: Vec<(PtrTyId, spirv::BuiltIn)>,
     pub composite_types: Vec<CompositeTy>,
-    pub ptr_types: Vec<Ty>,
+    pub ptr_types: Vec<(Ty, Box<[spirv::Decoration]>)>,
     pub config: IRConfig,
     pub entry_point: Option<(FunctionId, Box<[Variable]>)>,
 }
@@ -23,7 +24,7 @@ pub struct IR {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Types<'a> {
     pub composite: &'a [CompositeTy],
-    pub ptr: &'a [Ty],
+    pub ptr: &'a [(Ty, Box<[spirv::Decoration]>)],
 }
 
 #[derive(Default, Debug, Clone)]
@@ -88,6 +89,8 @@ pub struct Private(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageBufferId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinId(pub usize); // NOTE: Maybe use an enum for this
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     Parameter(Parameter),
     Temporary(Temporary),
@@ -98,6 +101,7 @@ pub enum Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variable {
     Private(Private),
+    Builtin(BuiltinId),
     StorageBuffer(StorageBufferId),
 }
 
@@ -131,6 +135,12 @@ impl From<StorageBufferId> for Value {
     }
 }
 
+impl From<BuiltinId> for Value {
+    fn from(v: BuiltinId) -> Self {
+        Value::Variable(Variable::Builtin(v))
+    }
+}
+
 impl From<ConstantId> for Value {
     fn from(v: ConstantId) -> Self {
         Value::Constant(v)
@@ -140,6 +150,12 @@ impl From<ConstantId> for Value {
 impl From<StorageBufferId> for Variable {
     fn from(v: StorageBufferId) -> Self {
         Variable::StorageBuffer(v)
+    }
+}
+
+impl From<BuiltinId> for Variable {
+    fn from(v: BuiltinId) -> Self {
+        Variable::Builtin(v)
     }
 }
 
@@ -184,6 +200,7 @@ struct ShaderScope<'a> {
 struct FunctionCompiler<'a> {
     type_mapper: &'a mut LazyTypeMapper,
     constant_ids: &'a [Word],
+    builtin_ids: &'a [Word],
     function: &'a Function,
     ir_types: Types<'a>,
     parameter_ids: Box<[u32]>,
@@ -192,8 +209,6 @@ struct FunctionCompiler<'a> {
     func_id: u32,
     scope: ShaderScope<'a>,
 }
-
-pub struct CompiledModule(pub Vec<Word>);
 
 impl TranslateFrom<IR> for SPVModule {
     type Error = Error;
@@ -250,9 +265,6 @@ impl TranslateFrom<IR> for SPVModule {
                         ty,
                         StorageClass::StorageBuffer,
                     );
-                    let base_ty = &ir.ptr_types[ty.0];
-                    let base_ty_id = type_mapper.get(&mut b, ir.types(), &constant_ids, base_ty);
-                    b.decorate(base_ty_id, spirv::Decoration::Block, []);
                     let id = b.variable(
                         ty_id,
                         None,
@@ -277,6 +289,27 @@ impl TranslateFrom<IR> for SPVModule {
             )
             .collect::<Box<[_]>>();
 
+        let builtin_ids = ir
+            .builtins
+            .iter()
+            .map(|&(ty, which)| {
+                let ty_id = type_mapper.get_ptr(
+                    &mut b,
+                    ir.types(),
+                    &constant_ids,
+                    ty,
+                    StorageClass::Input,
+                );
+                let id = b.variable(ty_id, None, StorageClass::Input, None);
+                b.decorate(
+                    id,
+                    spirv::Decoration::BuiltIn,
+                    [rspirv::dr::Operand::BuiltIn(which)],
+                );
+                id
+            })
+            .collect::<Box<[_]>>();
+
         let mut spirv_functions = Vec::with_capacity(ir.functions.len());
 
         for i in 0..ir.functions.len() {
@@ -284,6 +317,7 @@ impl TranslateFrom<IR> for SPVModule {
                 &mut b,
                 &mut type_mapper,
                 &constant_ids,
+                &builtin_ids,
                 &ir.functions[i],
                 &ir,
                 ShaderScope {
@@ -309,6 +343,7 @@ impl TranslateFrom<IR> for SPVModule {
                         Variable::StorageBuffer(StorageBufferId(i)) => {
                             storage_buffer_ids[i]
                         }
+                        Variable::Builtin(BuiltinId(i)) => builtin_ids[i],
                         _ => todo!(),
                     })
                     .collect::<Box<[_]>>(),
@@ -340,9 +375,13 @@ impl IR {
         }
     }
 
-    pub fn make_ptr_type(&mut self, ty: Ty) -> PtrTyId {
+    pub fn make_ptr_type(
+        &mut self,
+        ty: Ty,
+        decorations: impl Into<Box<[spirv::Decoration]>>,
+    ) -> PtrTyId {
         let id = self.ptr_types.len();
-        self.ptr_types.push(ty);
+        self.ptr_types.push((ty, decorations.into()));
         PtrTyId(id)
     }
 
@@ -359,6 +398,16 @@ impl IR {
         let id = self.storage_buffers.len();
         self.storage_buffers.push(storage_buffer);
         StorageBufferId(id)
+    }
+
+    pub fn make_builtin(
+        &mut self,
+        ty: PtrTyId,
+        builtin: spirv::BuiltIn,
+    ) -> BuiltinId {
+        let id = self.builtins.len();
+        self.builtins.push((ty, builtin));
+        BuiltinId(id)
     }
 
     pub fn make_constant(&mut self, constant: Constant) -> ConstantId {
@@ -486,6 +535,7 @@ impl<'a> FunctionCompiler<'a> {
         b: &mut SPVBuilder,
         type_mapper: &'a mut LazyTypeMapper,
         constant_ids: &'a [Word],
+        builtin_ids: &'a [Word],
         func: &'a Function,
         ir: &'a IR,
         scope: ShaderScope<'a>,
@@ -530,6 +580,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(FunctionCompiler {
             type_mapper,
             constant_ids,
+            builtin_ids,
             function: func,
             ir_types: ir.types(),
             func_id,
@@ -549,6 +600,9 @@ impl<'a> FunctionCompiler<'a> {
             }
             Value::Variable(Variable::StorageBuffer(StorageBufferId(i))) => {
                 self.scope.storage_buffers[i]
+            }
+            Value::Variable(Variable::Builtin(BuiltinId(i))) => {
+                self.builtin_ids[i]
             }
             Value::Constant(ConstantId(i)) => self.scope.constants[i],
         }
@@ -746,15 +800,22 @@ impl LazyTypeMapper {
         b: &mut SPVBuilder,
         ir_types: Types<'_>,
         constants: &[Word],
-        ptr_ty: PtrTyId,
+        PtrTyId(i): PtrTyId,
         storage_class: StorageClass,
     ) -> Word {
-        let Some(ty) = ir_types.ptr.get(ptr_ty.0) else {
+        let Some((ty, decorations)) = ir_types.ptr.get(i) else {
             unreachable!()
         };
         let base = self.get(b, ir_types, constants, ty);
-        *self.ptrs[ptr_ty.0]
-            .get_or_insert_with(|| b.type_pointer(None, storage_class, base))
+        *self.ptrs[i].get_or_insert_with(|| {
+            let id = b.type_pointer(None, storage_class, base);
+            // TODO: Find a way to decorate types directly, instead of through pointer
+            // hackery
+            for decor in decorations {
+                b.decorate(base, *decor, []);
+            }
+            id
+        })
     }
 
     fn get_void(&mut self, b: &mut SPVBuilder) -> Word {
@@ -920,7 +981,7 @@ pub mod test_utils {
     pub fn make_module(config: IRConfig) -> SPVModule {
         let mut ir = IR::new(config);
         let t0 = Ty::Scalar(ScalarTy::F32);
-        let t0_ptr = ir.make_ptr_type(t0);
+        let t0_ptr = ir.make_ptr_type(t0, []);
         let t0_rt_array =
             ir.make_composite_type(CompositeTy::Array1(t0, None)).into();
         let t2_input =
@@ -933,8 +994,17 @@ pub mod test_utils {
                 ty: t0_rt_array,
                 writable: true,
             }]));
-        let t3_input = ir.make_ptr_type(t2_input.into());
-        let t3_output = ir.make_ptr_type(t2_output.into());
+        let t3_input =
+            ir.make_ptr_type(t2_input.into(), [spirv::Decoration::Block]);
+        let t3_output =
+            ir.make_ptr_type(t2_output.into(), [spirv::Decoration::Block]);
+
+        let t_u32_vec3 = Ty::Vec(ScalarTy::U32, 3);
+        let t_u32_vec3_ptr = ir.make_ptr_type(t_u32_vec3, []);
+        let t_u32 = Ty::Scalar(ScalarTy::U32);
+        let t_u32_ptr = ir.make_ptr_type(t_u32, []);
+        let global_invocation_id =
+            ir.make_builtin(t_u32_vec3_ptr, spirv::BuiltIn::GlobalInvocationId);
 
         let u32_0 = ir
             .make_constant(Constant::Scalar(ScalarConstant::U32(0)))
@@ -956,12 +1026,24 @@ pub mod test_utils {
         });
 
         let mut main = Function::new(Some("main".into()), None);
+        let global_invocation_id_x_ptr =
+            main.append_value_node(ValueNode::access(
+                t_u32_ptr,
+                StorageClass::Input,
+                global_invocation_id.into(),
+                [u32_0],
+            ));
+        let x = main.append_value_node(ValueNode::load(
+            Ty::Scalar(ScalarTy::U32),
+            global_invocation_id_x_ptr.into(),
+        ));
+
         let [a, b] = inputs.map(|input| {
             let ptr_id = main.append_value_node(ValueNode::access(
                 t0_ptr,
                 StorageClass::StorageBuffer,
                 input.into(),
-                [u32_0, u32_0],
+                [u32_0, x.into()],
             ));
             main.append_value_node(ValueNode::load(t0, ptr_id.into()))
         });
@@ -972,7 +1054,7 @@ pub mod test_utils {
             t0_ptr,
             StorageClass::StorageBuffer,
             output.into(),
-            [u32_0, u32_0],
+            [u32_0, x.into()],
         ));
         main.append_node(Node::Store(
             output_access.into(),
@@ -983,7 +1065,12 @@ pub mod test_utils {
         let main_func = ir.make_function(main);
         ir.entry_point(
             main_func,
-            [inputs[0].into(), inputs[1].into(), output.into()],
+            [
+                global_invocation_id.into(),
+                inputs[0].into(),
+                inputs[1].into(),
+                output.into(),
+            ],
         );
 
         SPVModule::translate_from(ir).unwrap()
@@ -1003,7 +1090,10 @@ mod tests {
 
     #[test]
     fn test() {
-        let module = test_utils::make_module(Default::default());
+        let module = test_utils::make_module(IRConfig {
+            local_size: [1, 1, 1],
+            ..Default::default()
+        });
         eprintln!("{}", module.disassemble());
         let raw = module.assemble();
         assert_ne!(raw.len(), 0);
@@ -1019,12 +1109,13 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        stdin
-            .write_all(unsafe { raw.as_slice().align_to::<u8>().1 })
-            .unwrap();
-        stdin.flush().unwrap();
-        drop(stdin);
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin
+                .write_all(unsafe { raw.as_slice().align_to::<u8>().1 })
+                .unwrap();
+            stdin.flush().unwrap();
+        }
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
     }
