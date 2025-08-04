@@ -1,6 +1,6 @@
 use core::result::Result as CoreResult;
 
-use crate::l_base::{TranslateFrom, ScalarTy};
+use crate::l_base::{ScalarTy, TranslateFrom};
 use crate::l0;
 
 pub use crate::l0::{Output, Parameter, Temporary, Value};
@@ -21,7 +21,7 @@ pub struct Instruction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argument {
     pub ty: ScalarTy,
-    pub shape: Vec<usize>,
+    pub shape: Box<[usize]>,
     pub batch_dim: Option<BatchDimension>,
 }
 
@@ -106,7 +106,7 @@ impl<'a> IRBuilder<'a> {
                 })?;
             self.inputs.push(Argument {
                 ty: input.ty,
-                shape,
+                shape: shape.into_boxed_slice(),
                 batch_dim,
             });
         }
@@ -187,7 +187,10 @@ impl<'a> IRBuilder<'a> {
     }
 }
 
-fn match_ty(lhs: ScalarTy, rhs: ScalarTy) -> CoreResult<ScalarTy, InstructionError> {
+fn match_ty(
+    lhs: ScalarTy,
+    rhs: ScalarTy,
+) -> CoreResult<ScalarTy, InstructionError> {
     if lhs == rhs {
         Ok(lhs)
     } else {
@@ -198,7 +201,7 @@ fn match_ty(lhs: ScalarTy, rhs: ScalarTy) -> CoreResult<ScalarTy, InstructionErr
 fn match_shape(
     lhs: &Argument,
     rhs: &Argument,
-) -> CoreResult<(Vec<usize>, Option<BatchDimension>), InstructionError> {
+) -> CoreResult<(Box<[usize]>, Option<BatchDimension>), InstructionError> {
     if lhs.shape == rhs.shape && lhs.batch_dim == rhs.batch_dim {
         Ok((lhs.shape.clone(), lhs.batch_dim))
     } else {

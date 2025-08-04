@@ -19,13 +19,16 @@ pub enum CompositeTy {
     // Array2(Ty, Option<usize>, usize),
     // Array3(Ty, Option<usize>, usize, usize),
     // ArrayN(Ty, Option<usize>, Box<[usize]>),
-    Struct(Box<[StructMember]>),
+    Struct {
+        fields: Box<[StructMember]>,
+        is_block: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructMember {
     pub ty: Ty,
-    pub writable: bool
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +44,13 @@ impl From<CompositeTyId> for Ty {
 }
 
 impl CompositeTy {
-    pub fn r#struct(members: impl Into<Box<[StructMember]>>) -> Self {
-        Self::Struct(members.into())
+    pub fn r#struct(
+        fields: impl Into<Box<[StructMember]>>,
+        is_block: bool,
+    ) -> Self {
+        Self::Struct {
+            fields: fields.into(),
+            is_block,
+        }
     }
 }

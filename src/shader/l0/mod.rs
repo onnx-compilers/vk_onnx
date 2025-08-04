@@ -11,24 +11,24 @@ use ty::{CompositeTy, CompositeTyId, PtrTyId, StructMember, Ty};
 
 #[derive(Debug, Default, Clone)]
 pub struct IR {
-    pub functions: Vec<Function>,
-    pub constants: Vec<Constant>,
-    pub storage_buffers: Vec<StorageBuffer>,
-    pub builtins: Vec<(PtrTyId, spirv::BuiltIn)>,
-    pub composite_types: Vec<CompositeTy>,
-    pub ptr_types: Vec<(Ty, Box<[spirv::Decoration]>)>,
-    pub config: IRConfig,
-    pub entry_point: Option<(FunctionId, Box<[Variable]>)>,
+    functions: Vec<Function>,
+    constants: Vec<Constant>,
+    storage_buffers: Vec<StorageBuffer>,
+    builtins: Vec<(PtrTyId, spirv::BuiltIn)>,
+    composite_types: Vec<CompositeTy>,
+    ptr_types: Vec<Ty>,
+    config: Config,
+    entry_point: Option<(FunctionId, Box<[Variable]>)>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
-pub struct Types<'a> {
-    pub composite: &'a [CompositeTy],
-    pub ptr: &'a [(Ty, Box<[spirv::Decoration]>)],
+struct Types<'a> {
+    composite: &'a [CompositeTy],
+    ptr: &'a [Ty],
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct IRConfig {
+pub struct Config {
     pub local_size: [u32; 3],
     // TODO: Fill this in Default::default() instead of using an option
     pub version: Option<(u8, u8)>,
@@ -44,12 +44,12 @@ pub struct StorageBuffer {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Function {
-    pub name: Option<String>,
-    pub ret: Option<Ty>,
-    pub args: Vec<Ty>,
-    pub vars: Vec<(PtrTyId, Option<Value>)>,
-    pub body: Vec<Node>,
-    pub value_nodes: Vec<ValueNode>,
+    name: Option<String>,
+    ret: Option<Ty>,
+    args: Vec<Ty>,
+    vars: Vec<(PtrTyId, Option<Value>)>,
+    body: Vec<Node>,
+    value_nodes: Vec<ValueNode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,27 +361,23 @@ impl TranslateFrom<IR> for SPVModule {
 }
 
 impl IR {
-    pub fn new(config: IRConfig) -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             config,
             ..Default::default()
         }
     }
 
-    pub fn types(&self) -> Types {
+    fn types(&self) -> Types {
         Types {
             composite: &self.composite_types,
             ptr: &self.ptr_types,
         }
     }
 
-    pub fn make_ptr_type(
-        &mut self,
-        ty: Ty,
-        decorations: impl Into<Box<[spirv::Decoration]>>,
-    ) -> PtrTyId {
+    pub fn make_ptr_type(&mut self, ty: Ty) -> PtrTyId {
         let id = self.ptr_types.len();
-        self.ptr_types.push((ty, decorations.into()));
+        self.ptr_types.push(ty);
         PtrTyId(id)
     }
 
@@ -486,7 +482,7 @@ impl Function {
 }
 
 impl Ty {
-    pub fn same_as(&self, other: &Ty, _types: Types<'_>) -> bool {
+    fn same_as(&self, other: &Ty, _types: Types<'_>) -> bool {
         self == other // TODO: composite comparison
     }
 }
@@ -803,17 +799,12 @@ impl LazyTypeMapper {
         PtrTyId(i): PtrTyId,
         storage_class: StorageClass,
     ) -> Word {
-        let Some((ty, decorations)) = ir_types.ptr.get(i) else {
+        let Some(ty) = ir_types.ptr.get(i) else {
             unreachable!()
         };
         let base = self.get(b, ir_types, constants, ty);
         *self.ptrs[i].get_or_insert_with(|| {
             let id = b.type_pointer(None, storage_class, base);
-            // TODO: Find a way to decorate types directly, instead of through pointer
-            // hackery
-            for decor in decorations {
-                b.decorate(base, *decor, []);
-            }
             id
         })
     }
@@ -862,8 +853,8 @@ impl LazyTypeMapper {
             &CompositeTy::Array1(ref ty, Some(len)) => {
                 self.make_array1(b, ir_types, constants, ty, len)
             }
-            CompositeTy::Struct(fields) => {
-                self.make_struct(b, ir_types, constants, fields)
+            CompositeTy::Struct { fields, is_block } => {
+                self.make_struct(b, ir_types, constants, fields, *is_block)
             }
         }
     }
@@ -909,6 +900,7 @@ impl LazyTypeMapper {
         ir_types: Types<'_>,
         constants: &[Word],
         fields: &[StructMember],
+        is_block: bool,
     ) -> Word {
         let field_ids = fields
             .iter()
@@ -916,6 +908,9 @@ impl LazyTypeMapper {
             .collect::<Box<[_]>>();
         let id = b.id();
         let id = b.type_struct_id(Some(id), field_ids);
+        if is_block {
+            b.decorate(id, spirv::Decoration::Block, []);
+        }
         // TODO: Maybe use this as the size
         let _ = fields.iter().enumerate().fold(
             0,
@@ -978,31 +973,34 @@ impl LazyScalarTypeMapper {
 pub mod test_utils {
     use super::*;
 
-    pub fn make_module(config: IRConfig) -> SPVModule {
+    pub fn make_module(config: Config) -> SPVModule {
         let mut ir = IR::new(config);
-        let t0 = Ty::Scalar(ScalarTy::F32);
-        let t0_ptr = ir.make_ptr_type(t0, []);
-        let t0_rt_array =
-            ir.make_composite_type(CompositeTy::Array1(t0, None)).into();
-        let t2_input =
-            ir.make_composite_type(CompositeTy::r#struct([StructMember {
-                ty: t0_rt_array,
+        let t_f32 = Ty::Scalar(ScalarTy::F32);
+        let t_f32_ptr = ir.make_ptr_type(t_f32);
+        let t_f32_rt_array = ir
+            .make_composite_type(CompositeTy::Array1(t_f32, None))
+            .into();
+        let t2_input = ir.make_composite_type(CompositeTy::r#struct(
+            [StructMember {
+                ty: t_f32_rt_array,
                 writable: false,
-            }]));
-        let t2_output =
-            ir.make_composite_type(CompositeTy::r#struct([StructMember {
-                ty: t0_rt_array,
+            }],
+            true,
+        ));
+        let t2_output = ir.make_composite_type(CompositeTy::r#struct(
+            [StructMember {
+                ty: t_f32_rt_array,
                 writable: true,
-            }]));
-        let t3_input =
-            ir.make_ptr_type(t2_input.into(), [spirv::Decoration::Block]);
-        let t3_output =
-            ir.make_ptr_type(t2_output.into(), [spirv::Decoration::Block]);
+            }],
+            true,
+        ));
+        let t3_input = ir.make_ptr_type(t2_input.into());
+        let t3_output = ir.make_ptr_type(t2_output.into());
 
         let t_u32_vec3 = Ty::Vec(ScalarTy::U32, 3);
-        let t_u32_vec3_ptr = ir.make_ptr_type(t_u32_vec3, []);
+        let t_u32_vec3_ptr = ir.make_ptr_type(t_u32_vec3);
         let t_u32 = Ty::Scalar(ScalarTy::U32);
-        let t_u32_ptr = ir.make_ptr_type(t_u32, []);
+        let t_u32_ptr = ir.make_ptr_type(t_u32);
         let global_invocation_id =
             ir.make_builtin(t_u32_vec3_ptr, spirv::BuiltIn::GlobalInvocationId);
 
@@ -1040,18 +1038,18 @@ pub mod test_utils {
 
         let [a, b] = inputs.map(|input| {
             let ptr_id = main.append_value_node(ValueNode::access(
-                t0_ptr,
+                t_f32_ptr,
                 StorageClass::StorageBuffer,
                 input.into(),
                 [u32_0, x.into()],
             ));
-            main.append_value_node(ValueNode::load(t0, ptr_id.into()))
+            main.append_value_node(ValueNode::load(t_f32, ptr_id.into()))
         });
 
         let output_value =
-            main.append_value_node(ValueNode::fadd(t0, a.into(), b.into()));
+            main.append_value_node(ValueNode::fadd(t_f32, a.into(), b.into()));
         let output_access = main.append_value_node(ValueNode::access(
-            t0_ptr,
+            t_f32_ptr,
             StorageClass::StorageBuffer,
             output.into(),
             [u32_0, x.into()],
@@ -1090,7 +1088,7 @@ mod tests {
 
     #[test]
     fn test() {
-        let module = test_utils::make_module(IRConfig {
+        let module = test_utils::make_module(Config {
             local_size: [1, 1, 1],
             ..Default::default()
         });

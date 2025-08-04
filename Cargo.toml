@@ -10,3 +10,6 @@ vulkano = "0.35.1"
 
 [build-dependencies]
 protobuf-codegen = "3.7.2"
+
+# [profile.dev]
+# opt-level = 1

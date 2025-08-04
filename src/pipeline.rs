@@ -1,6 +1,7 @@
+// use std::alloc::Layout;
 use std::sync::Arc;
 
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
@@ -43,7 +44,7 @@ pub struct Pipeline {
 pub enum CreateError {
     EntryPointMainMissing,
     NoPhysicalDevice,
-    DeviceQueueLacksGraphics,
+    DeviceQueueLacksCompute,
     LoadingError(vulkano::LoadingError),
     VulkanError(vulkano::VulkanError),
     VulkanValidationError(Box<vulkano::ValidationError>),
@@ -90,14 +91,8 @@ impl From<IntoPipelineLayoutCreateInfoError> for CreateError {
     }
 }
 
-#[derive(BufferContents)]
-#[repr(C)]
-struct IOBuffer {
-    data: [f32; 2],
-}
-
 impl Pipeline {
-    pub fn new(spirv: &[u32]) -> Result<Self, CreateError> {
+    pub fn new(spirv: &[u32], len: usize) -> Result<Self, CreateError> {
         let library = VulkanLibrary::new()?;
         let instance = Instance::new(
             library,
@@ -118,9 +113,9 @@ impl Pipeline {
             .position(|(_queue_family_index, queue_family_properties)| {
                 queue_family_properties
                     .queue_flags
-                    .contains(QueueFlags::GRAPHICS)
+                    .contains(QueueFlags::COMPUTE)
             })
-            .ok_or_else(|| CreateError::DeviceQueueLacksGraphics)?
+            .ok_or_else(|| CreateError::DeviceQueueLacksCompute)?
             as u32;
 
         let (device, mut queues) = Device::new(
@@ -149,10 +144,11 @@ impl Pipeline {
                     },
                     AllocationCreateInfo {
                         memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                         ..Default::default()
                     },
-                    DeviceLayout::new_sized::<IOBuffer>(),
+                    // TODO: don't unwrap
+                    DeviceLayout::new_unsized::<[f32]>(len as u64).unwrap()
                 )
             })
             .collect::<Result<Box<[_]>, _>>()?;
@@ -207,7 +203,7 @@ impl Pipeline {
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             command_buffer_allocator.clone(),
             queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
+            CommandBufferUsage::MultipleSubmit,
         )?;
         let work_group_counts = [1, 1, 1];
 
@@ -249,38 +245,38 @@ mod tests {
     use rspirv::binary::Assemble;
     use vulkano::buffer::Subbuffer;
 
-    use crate::shader::l0::IRConfig;
+    use crate::shader::l0::Config;
 
     use super::*;
 
     #[test]
     fn test() {
-        let module = crate::shader::l0::test_utils::make_module(IRConfig {
+        let module = crate::shader::l0::test_utils::make_module(Config {
             local_size: [2, 1, 1],
             version: Some((1, 3)),
             ..Default::default()
         });
         let spirv = module.assemble();
-        let pipeline = Pipeline::new(spirv.as_slice()).unwrap();
+        let pipeline = Pipeline::new(spirv.as_slice(), 2).unwrap();
         {
             let [buf_a, buf_b] = [0, 1].map(|i| {
                 Into::<Subbuffer<[u8]>>::into(pipeline.buffers[i].clone())
-                    .reinterpret::<IOBuffer>()
+                    .reinterpret::<[f32]>()
             });
             let mut a = buf_a.write().unwrap();
             let mut b = buf_b.write().unwrap();
-            a.data[0] = 12.5;
-            a.data[1] = 0.0;
-            b.data[0] = 5.4;
-            b.data[1] = 1.0;
+            a[0] = 12.5;
+            a[1] = 0.0;
+            b[0] = 5.4;
+            b[1] = 1.0;
         }
         pipeline.run();
         {
             let buf_c =
                 Into::<Subbuffer<[u8]>>::into(pipeline.buffers[2].clone())
-                    .reinterpret::<IOBuffer>();
+                    .reinterpret::<[f32]>();
             let c = buf_c.read().unwrap();
-            assert_eq!(dbg!(c.data), [17.9, 1.0]);
+            assert_eq!(dbg!(&c[..]), [17.9, 1.0]);
         }
     }
 }

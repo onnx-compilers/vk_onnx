@@ -6,15 +6,15 @@ layout (set = 0, binding = 0) uniform Config {
   int size;
 } config;
 
-layout (set = 0, binding = 1) readonly buffer InputBufferA {
+layout (std140, set = 0, binding = 1) readonly buffer InputBufferA {
   int values[];
 } inputA;
 
-layout (set = 0, binding = 2) readonly buffer InputBufferB {
+layout (std140, set = 0, binding = 2) readonly buffer InputBufferB {
   int values[];
 } inputB;
 
-layout (set = 0, binding = 2) buffer OutputBufferC {
+layout (std140, set = 0, binding = 2) buffer OutputBufferC {
   int values[];
 } outputC;
 
