@@ -37,6 +37,12 @@ pub struct PtrTyId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositeTyId(pub usize);
 
+impl From<ScalarTy> for Ty {
+    fn from(ty: ScalarTy) -> Self {
+        Ty::Scalar(ty)
+    }
+}
+
 impl From<CompositeTyId> for Ty {
     fn from(id: CompositeTyId) -> Self {
         Ty::Composite(id)

@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
+};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::layout::DescriptorSetLayout;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -18,11 +21,11 @@ use vulkano::memory::allocator::{
 };
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::layout::{
-    IntoPipelineLayoutCreateInfoError,
-    PipelineLayoutCreateInfo,
+    IntoPipelineLayoutCreateInfoError, PipelineLayoutCreateInfo,
 };
 use vulkano::pipeline::{
-    ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    PipelineShaderStageCreateInfo,
 };
 use vulkano::shader::EntryPoint;
 use vulkano::{Validated, Version, VulkanError, VulkanLibrary};
@@ -33,6 +36,8 @@ pub struct Context {
     pub instance: Arc<Instance>,
     pub physical_device: Arc<PhysicalDevice>,
     pub device: Arc<Device>,
+    // TODO: Maybe use multiple queues and have parallel pipeline execution
+    // could consider the queues like registers in SSA compilers.
     pub queue: Arc<Queue>,
     pub alloc: Arc<StandardMemoryAllocator>,
     pub descriptor_set_alloc: Arc<StandardDescriptorSetAllocator>,
@@ -111,9 +116,8 @@ impl Context {
             .next()
             .ok_or_else(|| CreateError::DeviceQueueLacksCompute)?;
 
-        let alloc = Arc::new(StandardMemoryAllocator::new_default(
-            device.clone(),
-        ));
+        let alloc =
+            Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let descriptor_set_alloc =
             Arc::new(StandardDescriptorSetAllocator::new(
                 device.clone(),
@@ -192,6 +196,30 @@ impl Context {
             }),
             [],
         )
+    }
+
+    pub fn make_command_buffer(
+        &self,
+        pipeline: Arc<ComputePipeline>,
+        descriptor_sets: impl Iterator<Item = Arc<DescriptorSet>>,
+        first_set: u32,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>, Validated<VulkanError>> {
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.command_buffer_alloc.clone(),
+            self.queue.queue_family_index(),
+            CommandBufferUsage::MultipleSubmit,
+        )?;
+        let layout = pipeline.layout().clone();
+        let _ = builder.bind_pipeline_compute(pipeline)?;
+        for descriptor_set in descriptor_sets {
+            let _ = builder.bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                layout.clone(),
+                first_set,
+                descriptor_set,
+            )?;
+        }
+        builder.build()
     }
 }
 

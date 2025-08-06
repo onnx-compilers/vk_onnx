@@ -6,14 +6,15 @@ use crate::l_base::{ScalarTy, TranslateFrom};
 use rspirv::dr::{Builder as SPVBuilder, Module as SPVModule};
 use rspirv::spirv::{self, StorageClass, Word};
 
-use constant::{Constant, ConstantId, ScalarConstant};
-use ty::{CompositeTy, CompositeTyId, PtrTyId, StructMember, Ty};
+pub use constant::{Constant, ConstantId, ScalarConstant};
+pub use ty::{CompositeTy, CompositeTyId, PtrTyId, StructMember, Ty};
 
 #[derive(Debug, Default, Clone)]
 pub struct IR {
     functions: Vec<Function>,
     constants: Vec<Constant>,
     storage_buffers: Vec<StorageBuffer>,
+    uniforms: Vec<Uniform>,
     builtins: Vec<(PtrTyId, spirv::BuiltIn)>,
     composite_types: Vec<CompositeTy>,
     ptr_types: Vec<Ty>,
@@ -40,6 +41,13 @@ pub struct StorageBuffer {
     pub descriptor_set: u32,
     pub binding: u32,
     pub writable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uniform {
+    pub ty: PtrTyId,
+    pub descriptor_set: u32,
+    pub binding: u32,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -89,6 +97,8 @@ pub struct Private(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageBufferId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniformId(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinId(pub usize); // NOTE: Maybe use an enum for this
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
@@ -103,6 +113,7 @@ pub enum Variable {
     Private(Private),
     Builtin(BuiltinId),
     StorageBuffer(StorageBufferId),
+    Uniform(UniformId),
 }
 
 impl From<Parameter> for Value {
@@ -135,6 +146,12 @@ impl From<StorageBufferId> for Value {
     }
 }
 
+impl From<UniformId> for Value {
+    fn from(v: UniformId) -> Self {
+        Value::Variable(Variable::Uniform(v))
+    }
+}
+
 impl From<BuiltinId> for Value {
     fn from(v: BuiltinId) -> Self {
         Value::Variable(Variable::Builtin(v))
@@ -150,6 +167,12 @@ impl From<ConstantId> for Value {
 impl From<StorageBufferId> for Variable {
     fn from(v: StorageBufferId) -> Self {
         Variable::StorageBuffer(v)
+    }
+}
+
+impl From<UniformId> for Variable {
+    fn from(v: UniformId) -> Self {
+        Variable::Uniform(v)
     }
 }
 
@@ -195,6 +218,7 @@ struct LazyScalarTypeMapper {
 struct ShaderScope<'a> {
     constants: &'a [Word],
     storage_buffers: &'a [Word],
+    uniforms: &'a [Word],
 }
 
 struct FunctionCompiler<'a> {
@@ -289,6 +313,47 @@ impl TranslateFrom<IR> for SPVModule {
             )
             .collect::<Box<[_]>>();
 
+        let uniform_ids = ir
+            .uniforms
+            .iter()
+            // TODO: Maybe put this in a declared function
+            .map(
+                |&Uniform {
+                     descriptor_set,
+                     binding,
+                     ty,
+                 }| {
+                    let ty_id = type_mapper.get_ptr(
+                        &mut b,
+                        ir.types(),
+                        &constant_ids,
+                        ty,
+                        StorageClass::Uniform,
+                    );
+                    let id = b.variable(
+                        ty_id,
+                        None,
+                        StorageClass::Uniform,
+                        None,
+                    );
+                    b.decorate(
+                        id,
+                        spirv::Decoration::DescriptorSet,
+                        [descriptor_set.into()],
+                    );
+                    b.decorate(
+                        id,
+                        spirv::Decoration::Binding,
+                        [binding.into()],
+                    );
+                    // if !writable {
+                    //     b.decorate(id, spirv::Decoration::NonWritable, []);
+                    // }
+                    id
+                },
+            )
+            .collect::<Box<[_]>>();
+
         let builtin_ids = ir
             .builtins
             .iter()
@@ -321,8 +386,9 @@ impl TranslateFrom<IR> for SPVModule {
                 &ir.functions[i],
                 &ir,
                 ShaderScope {
-                    storage_buffers: &storage_buffer_ids,
                     constants: &constant_ids,
+                    storage_buffers: &storage_buffer_ids,
+                    uniforms: &uniform_ids,
                 },
             )?
             .compile(&mut b)?;
@@ -394,6 +460,15 @@ impl IR {
         let id = self.storage_buffers.len();
         self.storage_buffers.push(storage_buffer);
         StorageBufferId(id)
+    }
+
+    pub fn make_uniform(
+        &mut self,
+        uniform: Uniform,
+    ) -> UniformId {
+        let id = self.storage_buffers.len();
+        self.uniforms.push(uniform);
+        UniformId(id)
     }
 
     pub fn make_builtin(
@@ -596,6 +671,9 @@ impl<'a> FunctionCompiler<'a> {
             }
             Value::Variable(Variable::StorageBuffer(StorageBufferId(i))) => {
                 self.scope.storage_buffers[i]
+            }
+            Value::Variable(Variable::Uniform(UniformId(i))) => {
+                self.scope.uniforms[i]
             }
             Value::Variable(Variable::Builtin(BuiltinId(i))) => {
                 self.builtin_ids[i]
