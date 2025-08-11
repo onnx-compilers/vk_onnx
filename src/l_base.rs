@@ -1,6 +1,11 @@
-pub trait TranslateFrom<T> where Self: Sized {
-    type Error;
-    fn translate_from(source: T) -> Result<Self, Self::Error>;
+pub trait Translate<FromL, ToL> {
+    type Config: Sized;
+    type Error: Sized;
+    fn translate(
+        self,
+        from: FromL,
+        config: &Self::Config,
+    ) -> Result<ToL, Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

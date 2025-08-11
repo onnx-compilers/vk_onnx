@@ -1,7 +1,7 @@
 pub mod constant;
 pub mod ty;
 
-use crate::l_base::{ScalarTy, TranslateFrom};
+use crate::l_base::{ScalarTy, Translate};
 
 use rspirv::dr::{Builder as SPVBuilder, Module as SPVModule};
 use rspirv::spirv::{self, StorageClass, Word};
@@ -217,6 +217,7 @@ struct LazyScalarTypeMapper {
 #[derive(Debug, Clone, Copy)]
 struct ShaderScope<'a> {
     constants: &'a [Word],
+    builtins: &'a [Word],
     storage_buffers: &'a [Word],
     uniforms: &'a [Word],
 }
@@ -224,7 +225,6 @@ struct ShaderScope<'a> {
 struct FunctionCompiler<'a> {
     type_mapper: &'a mut LazyTypeMapper,
     constant_ids: &'a [Word],
-    builtin_ids: &'a [Word],
     function: &'a Function,
     ir_types: Types<'a>,
     parameter_ids: Box<[u32]>,
@@ -234,9 +234,17 @@ struct FunctionCompiler<'a> {
     scope: ShaderScope<'a>,
 }
 
-impl TranslateFrom<IR> for SPVModule {
+#[derive(Default)]
+pub struct SPVModuleBuilder;
+
+impl Translate<IR, SPVModule> for SPVModuleBuilder {
+    type Config = ();
     type Error = Error;
-    fn translate_from(ir: IR) -> Result<Self, Self::Error> {
+    fn translate(
+        mut self,
+        ir: IR,
+        _config: &Self::Config,
+    ) -> Result<SPVModule, Self::Error> {
         let mut b = SPVBuilder::new();
         let (major, minor) = ir
             .config
@@ -330,12 +338,8 @@ impl TranslateFrom<IR> for SPVModule {
                         ty,
                         StorageClass::Uniform,
                     );
-                    let id = b.variable(
-                        ty_id,
-                        None,
-                        StorageClass::Uniform,
-                        None,
-                    );
+                    let id =
+                        b.variable(ty_id, None, StorageClass::Uniform, None);
                     b.decorate(
                         id,
                         spirv::Decoration::DescriptorSet,
@@ -382,13 +386,13 @@ impl TranslateFrom<IR> for SPVModule {
                 &mut b,
                 &mut type_mapper,
                 &constant_ids,
-                &builtin_ids,
                 &ir.functions[i],
                 &ir,
                 ShaderScope {
                     constants: &constant_ids,
                     storage_buffers: &storage_buffer_ids,
                     uniforms: &uniform_ids,
+                    builtins: &builtin_ids,
                 },
             )?
             .compile(&mut b)?;
@@ -462,10 +466,7 @@ impl IR {
         StorageBufferId(id)
     }
 
-    pub fn make_uniform(
-        &mut self,
-        uniform: Uniform,
-    ) -> UniformId {
+    pub fn make_uniform(&mut self, uniform: Uniform) -> UniformId {
         let id = self.storage_buffers.len();
         self.uniforms.push(uniform);
         UniformId(id)
@@ -606,7 +607,6 @@ impl<'a> FunctionCompiler<'a> {
         b: &mut SPVBuilder,
         type_mapper: &'a mut LazyTypeMapper,
         constant_ids: &'a [Word],
-        builtin_ids: &'a [Word],
         func: &'a Function,
         ir: &'a IR,
         scope: ShaderScope<'a>,
@@ -651,7 +651,6 @@ impl<'a> FunctionCompiler<'a> {
         Ok(FunctionCompiler {
             type_mapper,
             constant_ids,
-            builtin_ids,
             function: func,
             ir_types: ir.types(),
             func_id,
@@ -676,7 +675,7 @@ impl<'a> FunctionCompiler<'a> {
                 self.scope.uniforms[i]
             }
             Value::Variable(Variable::Builtin(BuiltinId(i))) => {
-                self.builtin_ids[i]
+                self.scope.builtins[i]
             }
             Value::Constant(ConstantId(i)) => self.scope.constants[i],
         }
@@ -1149,7 +1148,7 @@ pub mod test_utils {
             ],
         );
 
-        SPVModule::translate_from(ir).unwrap()
+        SPVModuleBuilder::default().translate(ir, &()).unwrap()
     }
 }
 

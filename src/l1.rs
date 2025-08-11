@@ -1,11 +1,11 @@
 use core::result::Result as CoreResult;
 
-use crate::l_base::{ScalarTy, TranslateFrom};
+use crate::l_base::{ScalarTy, Translate};
 use crate::l0;
 
 pub use crate::l0::{Output, Parameter, Temporary, Value};
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct IR {
     pub inputs: Vec<Argument>,
     pub outputs: Vec<Output>,
@@ -22,7 +22,7 @@ pub struct Instruction {
 pub struct Argument {
     pub ty: ScalarTy,
     pub shape: Box<[usize]>,
-    pub batch_dim: Option<BatchDimension>,
+    // pub batch_dim: Option<BatchDimension>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,9 +49,8 @@ pub enum BatchDimension {
     Last,
 }
 
-#[derive(Debug, Clone)]
-struct IRBuilder<'a> {
-    l0: &'a l0::IR,
+#[derive(Debug, Default, Clone)]
+struct IRBuilder {
     inputs: Vec<Argument>,
     instructions: Vec<Instruction>,
 }
@@ -73,30 +72,10 @@ enum InstructionError {
 
 type Result<V> = CoreResult<V, Error>;
 
-impl<'a> IRBuilder<'a> {
-    fn new(l0: &'a l0::IR) -> Self {
-        let inputs = Vec::with_capacity(l0.inputs.len());
-        Self {
-            l0,
-            inputs,
-            instructions: Vec::with_capacity(l0.operations.len()),
-        }
-    }
-
-    fn build(mut self) -> Result<IR> {
-        self.build_inputs()?;
-        self.build_instructions()?;
-
-        Ok(IR {
-            inputs: self.inputs,
-            instructions: self.instructions,
-            outputs: self.l0.outputs.clone(),
-        })
-    }
-
-    fn build_inputs(&mut self) -> Result<()> {
-        for (i, input) in self.l0.inputs.iter().enumerate() {
-            let (shape, batch_dim) = parse_shape(input.shape.as_slice())
+impl IRBuilder {
+    fn build_inputs(&mut self, l0: &l0::IR) -> Result<()> {
+        for (i, input) in l0.inputs.iter().enumerate() {
+            let (shape, _batch_dim) = parse_shape(input.shape.as_slice())
                 // NOTE: Maybe put this into a function
                 .map_err(|e| match e {
                     ShapeParseError::Shapeless => Error::MissingInputShape(i),
@@ -107,14 +86,14 @@ impl<'a> IRBuilder<'a> {
             self.inputs.push(Argument {
                 ty: input.ty,
                 shape: shape.into_boxed_slice(),
-                batch_dim,
+                // batch_dim,
             });
         }
         Ok(())
     }
 
-    fn build_instructions(&mut self) -> Result<()> {
-        let operations = &self.l0.operations;
+    fn build_instructions(&mut self, l0: &l0::IR) -> Result<()> {
+        let operations = &l0.operations;
         for (i, op) in operations.iter().enumerate() {
             match op {
                 &l0::Operation::BinOp(l0::BinOp { kind, lhs, rhs }) => {
@@ -177,12 +156,12 @@ impl<'a> IRBuilder<'a> {
         rhs: &Argument,
     ) -> CoreResult<Argument, InstructionError> {
         let ty = match_ty(lhs.ty, rhs.ty)?;
-        let (shape, batch_dim) = match_shape(&lhs, &rhs)?;
+        let shape /* , batch_dim */ = match_shape(&lhs, &rhs)?;
 
         Ok(Argument {
             ty,
             shape,
-            batch_dim,
+            // batch_dim,
         })
     }
 }
@@ -201,9 +180,9 @@ fn match_ty(
 fn match_shape(
     lhs: &Argument,
     rhs: &Argument,
-) -> CoreResult<(Box<[usize]>, Option<BatchDimension>), InstructionError> {
-    if lhs.shape == rhs.shape && lhs.batch_dim == rhs.batch_dim {
-        Ok((lhs.shape.clone(), lhs.batch_dim))
+) -> CoreResult<Box<[usize]>/* , Option<BatchDimension> */, InstructionError> {
+    if lhs.shape == rhs.shape /* && lhs.batch_dim == rhs.batch_dim */ {
+        Ok(lhs.shape.clone() /* , lhs.batch_dim */)
     } else {
         Err(InstructionError::ShapeMismatch)
     }
@@ -242,14 +221,39 @@ fn parse_shape(
     Ok((shape, batch_dim))
 }
 
-impl TranslateFrom<l0::IR> for IR {
+impl Translate<l0::IR, IR> for IRBuilder {
+    type Config = ();
     type Error = Error;
-    fn translate_from(ir: l0::IR) -> Result<Self> {
-        IRBuilder::new(&ir).build()
+
+    fn translate(mut self, l0: l0::IR, _config: &Self::Config) -> Result<IR> {
+        self.inputs.reserve(l0.inputs.len());
+        self.instructions.reserve(l0.operations.len());
+        self.build_inputs(&l0)?;
+        self.build_instructions(&l0)?;
+
+        Ok(IR {
+            inputs: self.inputs,
+            instructions: self.instructions,
+            outputs: l0.outputs,
+        })
     }
 }
 
 impl IR {
+    pub fn make_input(&mut self, argument: Argument) -> Parameter {
+        let i = self.inputs.len();
+        self.inputs.push(argument);
+        Parameter(i)
+    }
+
+    pub fn append_op(&mut self, op: Operation, result: Argument) -> Temporary {
+        let i = self.instructions.len();
+        self.instructions.push(Instruction { op, result });
+        let id = Temporary(i);
+        self.outputs.push(Output { value: Value::Temporary(id) });
+        id
+    }
+
     pub fn output_data(&self, idx: usize) -> Option<&Argument> {
         let Output { value } = self.outputs.get(idx)?;
         match value {
@@ -290,7 +294,7 @@ mod tests {
             })],
         };
 
-        let ir = IR::translate_from(ir).unwrap();
+        let ir = IRBuilder::default().translate(ir, &()).unwrap();
         assert_eq!(ir.inputs.len(), 2);
         assert_eq!(ir.outputs.len(), 1);
         assert_eq!(ir.instructions.len(), 1);

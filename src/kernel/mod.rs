@@ -4,6 +4,76 @@
 use crate::shader::l0::IR;
 
 pub mod componentwise {
+    //! ```scheme
+    //! (begin-for-template
+    //!  (define-struct Bindings ([inputs (Array 2 U32)]
+    //!                           [output U32]
+    //!                           [config U32]))
+    //! 
+    //!  (define-enum Op (Add))
+    //! 
+    //!  (define-struct TemplateConfig ([local-size (Array 3 U32)]
+    //!                                 [item-type ScalarTy]
+    //!                                 [descriptor-set U32]
+    //!                                 [bindings Bindings]
+    //!                                 [op Op])
+    //!    #:symbol "Config")
+    //! 
+    //!  (configuration TemplateConfig))
+    //! 
+    //! (define-type U32 (#%type 'u32))
+    //! (define-type U32-Vec3 (Vec U32 3))
+    //! (define-type T-RTArray (RTArray (#%get item-type)))
+    //! 
+    //! (define-struct Input ([values T-RTArray]) #:writable #f)
+    //! 
+    //! (define-struct Output ([values T-RTArray]) #:writable #t)
+    //! 
+    //! (define-struct Config ([offset U32]) #:writable #f #:export "KernelConfig")
+    //! 
+    //! (version 460)
+    //! (local-size (#%get local-size))
+    //! 
+    //! (define global-invocation-id (#%builtin U32-Vec3 'GlobalInvocationId))
+    //! 
+    //! (define input-a
+    //!   (#%storage-buffer Input
+    //!                     #:layout (#%layout #:set (#%get descriptor-set)
+    //!                                        #:binding (#%get bindings inputs 0))
+    //!                     #:writable #f))
+    //! 
+    //! (define input-b
+    //!   (#%storage-buffer Input
+    //!                     #:layout (#%layout #:set (#%get descriptor-set)
+    //!                                        #:binding (#%get bindings inputs 1))
+    //!                     #:writable #f))
+    //! 
+    //! (define output
+    //!   (#%storage-buffer Output
+    //!                     #:layout (#%layout #:set (#%get descriptor-set)
+    //!                                        #:binding (#%get bindings output))
+    //!                     #:writable #t))
+    //! 
+    //! 
+    //! (define config
+    //!   (#%uniform Config
+    //!              #:layout (#%layout #:set (#%get descriptor-set)
+    //!                                 #:binding (#%get bindings config))
+    //!              #:writable #f))
+    //! 
+    //! (interface
+    //!  global-invocation-id input-a input-b output config)
+    //! 
+    //! (define (main)
+    //!   (define idx (+i (load@ global-invocation-id x)
+    //!                  (load@ config offset)))
+    //!   (define c (#%match (#%tuple (#%get op))
+    //!              [(:: Op Add)
+    //!               (+ (%get item-type)
+    //!                  (load@ input-a values idx)
+    //!                  (load@ input-b values idx)))])
+    //!   (store (@ output values idx) c))
+    //! ```
     use crate::{
         l_base::ScalarTy,
         shader::l0::{

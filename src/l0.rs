@@ -3,7 +3,7 @@ use std::fmt::Debug;
 
 use protobuf::Enum;
 
-use crate::l_base::{ScalarTy, TranslateFrom};
+use crate::l_base::{ScalarTy, Translate};
 use crate::protos::onnx::tensor_proto::DataType;
 use crate::protos::onnx::tensor_shape_proto::{Dimension, dimension};
 use crate::protos::onnx::{self, TensorShapeProto, ValueInfoProto, type_proto};
@@ -57,14 +57,16 @@ pub struct BinOp<R: PartialEq + Eq> {
 }
 
 #[derive(Default)]
-struct IRBuilder<'a> {
-    model: &'a onnx::ModelProto,
+struct IRBuilder {
     operations: Vec<Operation>,
     inputs: Vec<Input>,
     outputs: Vec<Output>,
-    input_map: HashMap<&'a str, usize>,
-    output_map: HashMap<&'a str, Temporary>,
     tmp_count: usize,
+}
+
+struct IOMap<'a> {
+    input_map: HashMap<&'a str, Parameter>,
+    output_map: HashMap<&'a str, Temporary>,
 }
 
 #[derive(Debug)]
@@ -116,37 +118,13 @@ impl Debug for Value {
     }
 }
 
-impl<'a> IRBuilder<'a> {
-    fn new(model: &'a onnx::ModelProto) -> Self {
-        Self {
-            model,
-            inputs: Vec::with_capacity(model.graph.input.len()),
-            outputs: Vec::with_capacity(model.graph.output.len()),
-            input_map: HashMap::with_capacity(model.graph.input.len()),
-            tmp_count: 0,
-            ..Default::default()
-        }
-    }
-
-    fn build(mut self) -> Result<IR> {
-        self.build_inputs()?;
-        self.build_operations()?;
-        self.build_outputs()?;
-        Ok(IR {
-            operations: self.operations,
-            inputs: self.inputs,
-            input_names: self.input_map.keys().map(|k| k.to_string()).collect(),
-            outputs: self.outputs,
-            output_names: self
-                .output_map
-                .keys()
-                .map(|k| k.to_string())
-                .collect(),
-        })
-    }
-
-    fn build_inputs(&mut self) -> Result<()> {
-        for (i, input) in self.model.graph.input.iter().enumerate() {
+impl IRBuilder {
+    fn build_inputs<'a>(
+        &mut self,
+        input_map: &mut HashMap<&'a str, Parameter>,
+        graph: &'a onnx::GraphProto,
+    ) -> Result<()> {
+        for (i, input) in graph.input.iter().enumerate() {
             let ValueInfoProto {
                 name,
                 type_: raw_ty,
@@ -173,18 +151,22 @@ impl<'a> IRBuilder<'a> {
                 .ok_or(IRBuildError::ShapelessTensor(i))
                 .and_then(|shape_proto| parse_shape(shape_proto))?;
 
-            self.input_map.insert(name.as_str(), i);
             self.inputs.push(Input {
                 ty: elem_ty,
                 shape: dims,
             });
+            input_map.insert(name.as_str(), Parameter(i));
         }
 
         Ok(())
     }
 
-    fn build_operations(&mut self) -> Result<()> {
-        for (i, node) in self.model.graph.node.iter().enumerate() {
+    fn build_operations<'a>(
+        &mut self,
+        io_map: &mut IOMap<'a>,
+        graph: &'a onnx::GraphProto,
+    ) -> Result<()> {
+        for (i, node) in graph.node.iter().enumerate() {
             let op_type = node
                 .op_type
                 .as_ref()
@@ -206,12 +188,14 @@ impl<'a> IRBuilder<'a> {
                     }
                     let lhs_name = node.input[0].as_str();
                     let rhs_name = node.input[1].as_str();
-                    let lhs = self.find_operand(lhs_name).ok_or_else(|| {
-                        IRBuildError::UnknownInput { index: i, nth: 0 }
-                    })?;
-                    let rhs = self.find_operand(rhs_name).ok_or_else(|| {
-                        IRBuildError::UnknownInput { index: i, nth: 1 }
-                    })?;
+                    let lhs =
+                        io_map.find_operand(lhs_name).ok_or_else(|| {
+                            IRBuildError::UnknownInput { index: i, nth: 0 }
+                        })?;
+                    let rhs =
+                        io_map.find_operand(rhs_name).ok_or_else(|| {
+                            IRBuildError::UnknownInput { index: i, nth: 1 }
+                        })?;
                     let output_name = node.output[0].as_str();
                     (
                         Operation::BinOp(BinOp {
@@ -225,17 +209,21 @@ impl<'a> IRBuilder<'a> {
                 _ => todo!(),
             };
             self.operations.push(op);
-            self.output_map.insert(output_name, tmp);
+            io_map.output_map.insert(output_name, tmp);
         }
 
         Ok(())
     }
 
-    fn build_outputs(&mut self) -> Result<()> {
-        for (i, output) in self.model.graph.output.iter().enumerate() {
+    fn build_outputs(
+        &mut self,
+        io_map: &IOMap,
+        graph: &onnx::GraphProto,
+    ) -> Result<()> {
+        for (i, output) in graph.output.iter().enumerate() {
             let name =
                 output.name.as_ref().ok_or(IRBuildError::MissingName(i))?;
-            let value = self
+            let value = io_map
                 .find_operand(name.as_str())
                 .ok_or_else(|| IRBuildError::UnknownOutput(i))?;
             self.outputs.push(Output { value });
@@ -248,7 +236,9 @@ impl<'a> IRBuilder<'a> {
         self.tmp_count += 1;
         Temporary(idx)
     }
+}
 
+impl<'a> IOMap<'a> {
     fn find_operand(&self, name: &str) -> Option<Value> {
         self.input_map
             .get(name)
@@ -263,11 +253,50 @@ impl<'a> IRBuilder<'a> {
     }
 }
 
-impl TranslateFrom<onnx::ModelProto> for IR {
+impl Translate<onnx::ModelProto, IR> for IRBuilder {
+    type Config = ();
     type Error = IRBuildError;
-    fn translate_from(model: onnx::ModelProto) -> Result<IR> {
-        let builder = IRBuilder::new(&model);
-        builder.build()
+    fn translate(
+        mut self,
+        raw: onnx::ModelProto,
+        _config: &Self::Config,
+    ) -> Result<IR> {
+        let graph = raw.graph.unwrap();
+        let mut io_map = IOMap {
+            input_map: HashMap::with_capacity(graph.input.len()),
+            output_map: HashMap::with_capacity(graph.node.len()),
+        };
+        {
+            self.build_inputs(&mut io_map.input_map, &graph)?;
+            self.build_operations(&mut io_map, &graph)?;
+            self.build_outputs(&io_map, &graph)?;
+        }
+        let IRBuilder {
+            operations,
+            inputs,
+            outputs,
+            ..
+        } = self;
+        let onnx::GraphProto {
+            input: raw_inputs,
+            output: raw_outputs,
+            ..
+        } = graph;
+        let input_names = raw_inputs
+            .into_iter()
+            .map(|onnx::ValueInfoProto { name, .. }| name.unwrap())
+            .collect();
+        let output_names = raw_outputs
+            .into_iter()
+            .map(|onnx::ValueInfoProto { name, .. }| name.unwrap())
+            .collect();
+        Ok(IR {
+            operations,
+            inputs,
+            input_names,
+            outputs,
+            output_names,
+        })
     }
 }
 
@@ -325,12 +354,14 @@ mod tests {
         let graph_path = models_dir.join("simple_add.onnx");
         let bytes = std::fs::read(graph_path).unwrap();
         let model = ModelProto::parse_from_bytes(&bytes[..]).unwrap();
-        let ir = IR::translate_from(model).unwrap();
+        let ir = IRBuilder::default().translate(model, &()).unwrap();
         assert_eq!(ir.inputs.len(), 2);
-        assert!(ir.input_names
-            .iter()
-            .map(String::as_str)
-            .all(|name| ["X", "Y"].contains(&name)));
+        assert!(
+            ir.input_names
+                .iter()
+                .map(String::as_str)
+                .all(|name| ["X", "Y"].contains(&name))
+        );
         assert_eq!(
             ir.inputs[0],
             Input {
