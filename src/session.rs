@@ -1,12 +1,16 @@
 use std::alloc::{Layout, LayoutError};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
+use std::time::Duration;
 
 use vulkano::buffer::{
-    BufferContents, BufferReadGuard, BufferUsage, BufferWriteGuard, Subbuffer,
+    Buffer, BufferContents, BufferReadGuard, BufferUsage, BufferWriteGuard,
+    Subbuffer,
 };
+use vulkano::command_buffer::PrimaryAutoCommandBuffer;
 // use vulkano::pipeline::ComputePipeline;
-use vulkano::sync::HostAccessError;
+use vulkano::VulkanError;
+use vulkano::sync::{GpuFuture, HostAccessError};
 
 use crate::context::{Context, MakeBufferError};
 use crate::l_base::ScalarTy;
@@ -14,7 +18,15 @@ use crate::l_base::ScalarTy;
 #[derive(Debug)]
 pub struct Session {
     ctx: Arc<Context>,
+    pub input_buffers: Vec<(Arc<Buffer>, usize)>,
+    buffers: Vec<Arc<Buffer>>,
+    input_copy_commands: Vec<Arc<PrimaryAutoCommandBuffer>>,
     // pipelines: Vec<Arc<ComputePipeline>>,
+}
+
+pub struct Run<'a> {
+    session: &'a mut Session,
+    future: Box<dyn GpuFuture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +62,42 @@ pub enum MakeTensorError {
     MakeBufferError(MakeBufferError),
 }
 
+#[derive(Debug)]
+pub enum MakeInputBufferError {
+    MakeBuffer(MakeBufferError),
+    Validation(Box<vulkano::ValidationError>),
+    Vulkan(VulkanError),
+}
+
+impl From<MakeBufferError> for MakeInputBufferError {
+    fn from(err: MakeBufferError) -> Self {
+        MakeInputBufferError::MakeBuffer(err)
+    }
+}
+
+impl From<VulkanError> for MakeInputBufferError {
+    fn from(err: VulkanError) -> Self {
+        MakeInputBufferError::Vulkan(err)
+    }
+}
+
+impl From<Box<vulkano::ValidationError>> for MakeInputBufferError {
+    fn from(err: Box<vulkano::ValidationError>) -> Self {
+        MakeInputBufferError::Validation(err)
+    }
+}
+
+impl<T: Into<MakeInputBufferError>> From<vulkano::Validated<T>>
+    for MakeInputBufferError
+{
+    fn from(err: vulkano::Validated<T>) -> Self {
+        match err {
+            vulkano::Validated::Error(err) => err.into(),
+            vulkano::Validated::ValidationError(err) => err.into(),
+        }
+    }
+}
+
 pub struct TensorWriteGuard<'a, T> {
     buffer: BufferWriteGuard<'a, [T]>,
     shape: &'a [u32],
@@ -64,8 +112,40 @@ impl Session {
     pub fn new(ctx: Arc<Context>) -> Self {
         Self {
             ctx,
+            input_buffers: Vec::new(),
+            buffers: Vec::new(),
+            input_copy_commands: Vec::new(),
             // pipelines: Vec::new(),
         }
+    }
+
+    pub fn make_run(&mut self) -> Run {
+        Run::new(self, vulkano::sync::now(self.ctx.device.clone()).boxed())
+    }
+
+    pub fn make_input_buffer(
+        &mut self,
+        layout: Layout,
+    ) -> Result<Arc<Buffer>, MakeInputBufferError> {
+        let src = self.ctx.make_buffer(
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
+            false,
+            layout,
+        )?;
+        let dst = self.ctx.make_buffer(
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            true,
+            layout,
+        )?;
+        let i = self.buffers.len();
+        self.buffers.push(dst.clone());
+        self.input_buffers.push((src.clone(), i));
+        let cmd = self.ctx.make_buffer_copy_command(
+            Into::<Subbuffer<[u8]>>::into(src.clone()),
+            Into::<Subbuffer<[u8]>>::into(dst.clone()),
+        )?;
+        self.input_copy_commands.push(cmd);
+        Ok(src)
     }
 
     pub fn make_tensor(
@@ -94,6 +174,41 @@ impl Session {
                 layout,
             )?,
         })
+    }
+}
+
+impl<'a> Run<'a> {
+    pub fn new(
+        session: &'a mut Session,
+        future: impl Into<Box<dyn GpuFuture>>,
+    ) -> Self {
+        Self {
+            session,
+            future: future.into(),
+        }
+    }
+
+    pub fn transfer_inputs(&mut self, _diff: impl Iterator<Item = bool>) {
+        todo!(
+            "dispatch commands for copying to the buffer according to the diff"
+        )
+    }
+
+    pub fn run(&mut self) {
+        todo!("dispatch commands to run the vulkan pipelines")
+    }
+
+    pub fn transfer_outputs(&mut self) {
+        todo!(
+            "dispatch commands to transfer the data from the device buffers to the host"
+        )
+    }
+
+    pub fn wait(
+        self,
+        timeout: Option<Duration>,
+    ) -> Result<(), vulkano::Validated<VulkanError>> {
+        self.future.then_signal_fence_and_flush()?.wait(timeout)
     }
 }
 
@@ -201,7 +316,7 @@ mod tests {
                 batch_dim: None,
             })
             .unwrap();
-        let tensor  = TensorView::<f32>::try_from(&generic_tensor).unwrap();
+        let tensor = TensorView::<f32>::try_from(&generic_tensor).unwrap();
         eprintln!("{:?}", tensor);
         {
             let mut x = tensor.write().unwrap();
