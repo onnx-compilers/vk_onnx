@@ -8,8 +8,8 @@ use vulkano::command_buffer::PrimaryAutoCommandBuffer;
 use vulkano::pipeline::{ComputePipeline, PipelineShaderStageCreateInfo};
 use vulkano::shader::EntryPoint;
 // use vulkano::pipeline::ComputePipeline;
-use vulkano::VulkanError;
 use vulkano::sync::GpuFuture;
+use vulkano::{Validated, VulkanError};
 
 use crate::context::{Context, MakeBufferError};
 use crate::l_base::{ScalarTy, Translate};
@@ -241,6 +241,7 @@ pub enum TranslationError {
     Layout(LayoutError),
     MakeBuffer(MakeBufferError),
     MakeInputBuffer(MakeInputBufferError),
+    ShaderFromSpirV(Validated<vulkano::VulkanError>),
 }
 
 impl From<LayoutError> for TranslationError {
@@ -281,13 +282,17 @@ impl SessionBuilder {
         (Arc<Buffer>, BufferId),
         <Self as Translate<pipeline::IR, Session>>::Error,
     > {
-        Ok(self.session.make_storage_buffer(
-            Layout::array::<u8>(
-                ir.get_shape(buffer.dims_range).iter().product::<usize>()
-                    * size_of(buffer.ty),
-            )?,
-            None,
-        )?)
+        Ok(self.make_raw_buffer(Layout::array::<u8>(
+            ir.get_shape(buffer.dims_range).iter().product::<usize>()
+                * size_of(buffer.ty),
+        )?)?)
+    }
+
+    fn make_raw_buffer(
+        &mut self,
+        layout: Layout,
+    ) -> Result<(Arc<Buffer>, BufferId), MakeBufferError> {
+        self.session.make_storage_buffer(layout, None)
     }
 
     fn make_input_buffer(
@@ -311,10 +316,56 @@ impl SessionBuilder {
         rhs: &pipeline::Buffer,
         result: &pipeline::Buffer,
     ) -> Result<(), <Self as Translate<pipeline::IR, Session>>::Error> {
+        use crate::kernel::componentwise::{
+            self, Bindings, Config, KernelConfig, Op,
+        };
+        use crate::shader::l0::{Config as ShaderConfig, SPVModuleBuilder};
+        use rspirv::binary::Assemble;
+
         let (lhs_buf, lhs_id) = self.make_input_buffer(ir, lhs)?;
         let (rhs_buf, rhs_id) = self.make_input_buffer(ir, rhs)?;
         let (result_buf, result_id) = self.make_buffer(ir, result)?;
-        // TODO: Continue here
+        // TODO: Have these as constant buffers. Or reuse them.
+        let (config_buf, config_id) =
+            self.make_raw_buffer(Layout::new::<KernelConfig>())?;
+        let shader_ir = componentwise::new(Config {
+            item_type: lhs.ty,
+            descriptor_set: 0,
+            bindings: Bindings {
+                inputs: [0, 1],
+                output: 2,
+                config: 3,
+            },
+            op: Op::Add,
+        });
+        let rspirv_ir = SPVModuleBuilder::default()
+            .translate(
+                shader_ir,
+                &ShaderConfig {
+                    local_size: [
+                        ir.get_shape(lhs.dims_range).iter().product::<usize>()
+                            as u32,
+                        1,
+                        1,
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let spirv = rspirv_ir.assemble();
+        let shader =
+            unsafe { self.session.ctx.shader_from_spirv(spirv.as_slice()) }
+                .map_err(TranslationError::ShaderFromSpirV)?;
+        let entry_point = shader.entry_point("main").unwrap();
+        self.session.make_stage(
+            entry_point,
+            &[lhs_id, rhs_id, config_id],
+            &[result_id],
+        );
+        // TODO: [2025-08-16 00:01] Do the `TRANSFER_SRC` and `TRANSFER_DST`
+        // song and dance for the config. Maybe an
+        // `enum Op { Invoke(StageId), Copy(BufferId, SomeT) }`.
+        // Look at constants and stuff.
         Ok(())
     }
 }

@@ -29,7 +29,7 @@ use vulkano::pipeline::{
     ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::shader::EntryPoint;
+use vulkano::shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo};
 use vulkano::{Validated, Version, VulkanError, VulkanLibrary};
 
 #[derive(Debug)]
@@ -209,6 +209,18 @@ impl Context {
             }),
             [],
         )
+    }
+
+    pub unsafe fn shader_from_spirv(
+        &self,
+        spirv: &[u32],
+    ) -> Result<Arc<ShaderModule>, Validated<vulkano::VulkanError>> {
+        unsafe {
+            ShaderModule::new(
+                self.device.clone(),
+                ShaderModuleCreateInfo::new(spirv),
+            )
+        }
     }
 
     pub fn make_buffer_copy_command(
