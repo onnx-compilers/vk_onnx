@@ -3,16 +3,17 @@ use crate::l1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Buffer {
-    pub size: usize, // in bytes
+    pub ty: ScalarTy,
+    pub dims_range: (usize, usize)
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct IR {
-    pub source_buffers: Vec<Buffer>,
-    pub constant_buffers: Vec<Buffer>,
-    pub operand_buffers: Vec<Buffer>,
     pub inputs: Vec<OperandBufferId>,
     pub outputs: Vec<OperandBufferId>,
+    pub constant_buffers: Vec<Buffer>,
+    pub operand_buffers: Vec<Buffer>,
+    pub dims_pool: Vec<usize>,
     pub instructions: Vec<Instr>,
     pub operations: Vec<Op>,
 }
@@ -57,7 +58,7 @@ pub enum BinOperands {
         to_lhs: bool,
     },
     NotInplace {
-        res: OperandBufferId,
+        result: OperandBufferId,
         lhs: BufferId,
         rhs: BufferId,
     },
@@ -67,7 +68,7 @@ pub enum BinOperands {
 pub struct SourceBufferId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstantBufferId(pub usize);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperandBufferId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,10 +79,14 @@ impl IR {
         Default::default()
     }
 
-    pub fn make_source_buffer(&mut self, buffer: Buffer) -> SourceBufferId {
-        let id = self.source_buffers.len();
-        self.source_buffers.push(buffer);
-        SourceBufferId(id)
+    pub fn make_input(
+        &mut self,
+        buffer: Buffer,
+    ) -> (SourceBufferId, OperandBufferId) {
+        let i = self.inputs.len();
+        let id = self.make_operand_buffer(buffer);
+        self.inputs.push(id);
+        (SourceBufferId(i), id)
     }
 
     pub fn make_constant_buffer(&mut self, buffer: Buffer) -> ConstantBufferId {
@@ -100,6 +105,21 @@ impl IR {
         let id = self.operations.len();
         self.operations.push(op);
         OpId(id)
+    }
+
+    fn add_dimensions(&mut self, dims: &[usize]) -> (usize, usize) {
+        let start = self.dims_pool.len();
+        self.dims_pool.extend_from_slice(dims);
+        let end = self.dims_pool.len();
+        (start, end)
+    }
+
+    pub fn get_operand(&self, OperandBufferId(i): OperandBufferId) -> &Buffer {
+        &self.operand_buffers[i]
+    }
+
+    pub fn get_shape(&self, dims_range: (usize, usize)) -> &[usize] {
+        &self.dims_pool[dims_range.0..dims_range.1]
     }
 }
 
@@ -143,25 +163,26 @@ impl Translate<l1::IR, IR> for IRBuilder {
         _config: &Self::Config,
     ) -> Result<IR, Self::Error> {
         let mut ir = IR::new();
+
         self.inputs.reserve(l1.inputs.len());
         for &l1::Argument { ty, ref shape } in l1.inputs.iter() {
-            let element_count: usize = shape.iter().product();
             let buffer = Buffer {
-                size: element_count * size_of(ty),
+                ty,
+                dims_range: ir.add_dimensions(shape)
             };
-            let source_id = ir.make_source_buffer(buffer.clone());
-            let id = ir.make_operand_buffer(buffer);
-            self.inputs.push((source_id, id));
-            ir.inputs.push(id);
+            let (src_id, buf_id) = ir.make_input(buffer);
+            self.inputs.push((src_id, buf_id));
         }
+
         for &l1::Instruction {
             op: ref l1_op,
             result: l1::Argument { ty, ref shape },
         } in l1.instructions.iter()
         {
-            let element_count: usize = shape.iter().product();
+            let dims_range = ir.add_dimensions(shape);
             let buf = ir.make_operand_buffer(Buffer {
-                size: element_count * size_of(ty),
+                ty,
+                dims_range,
             });
             self.intermediates.push(buf);
             let op = match l1_op {
@@ -177,7 +198,7 @@ impl Translate<l1::IR, IR> for IRBuilder {
                         operands: BinOperands::NotInplace {
                             lhs,
                             rhs,
-                            res: buf,
+                            result: buf,
                         },
                     })
                 }
@@ -186,13 +207,17 @@ impl Translate<l1::IR, IR> for IRBuilder {
             // NOTE: Maybe put this in13 a function
             ir.instructions.push(Instr::Op(id));
         }
+
+        ir.outputs.reserve(l1.outputs.len());
+        for &l1::Output { value } in l1.outputs.iter() {
+            let BufferId::Operand(buf) = self.get_value(value).unwrap() else {
+                panic!("yo wtf man");
+            };
+            ir.outputs.push(buf);
+        }
+
         Ok(ir)
     }
-}
-
-fn size_of(_ty: ScalarTy) -> usize {
-    // XXX: Hack, must calculate/lookup sizes for respective element types
-    4
 }
 
 #[cfg(test)]
@@ -212,7 +237,7 @@ mod tests {
             ty: ScalarTy::F32,
             shape: Box::new([2, 2]),
         });
-        let _c = l1.append_op(
+        let c = l1.append_op(
             Operation::BinOp(BinOp {
                 kind: BinOpKind::Add,
                 lhs: a.into(),
@@ -223,6 +248,7 @@ mod tests {
                 shape: Box::new([2, 2]),
             },
         );
+        l1.add_output(c.into());
         let ir = IRBuilder::default().translate(l1, &()).unwrap();
         println!("{:?}", ir);
     }

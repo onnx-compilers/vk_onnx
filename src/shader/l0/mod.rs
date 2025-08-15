@@ -18,7 +18,6 @@ pub struct IR {
     builtins: Vec<(PtrTyId, spirv::BuiltIn)>,
     composite_types: Vec<CompositeTy>,
     ptr_types: Vec<Ty>,
-    config: Config,
     entry_point: Option<(FunctionId, Box<[Variable]>)>,
 }
 
@@ -238,16 +237,15 @@ struct FunctionCompiler<'a> {
 pub struct SPVModuleBuilder;
 
 impl Translate<IR, SPVModule> for SPVModuleBuilder {
-    type Config = ();
     type Error = Error;
+    type Config = Config;
     fn translate(
-        mut self,
+        self,
         ir: IR,
-        _config: &Self::Config,
+        config: &Self::Config,
     ) -> Result<SPVModule, Self::Error> {
         let mut b = SPVBuilder::new();
-        let (major, minor) = ir
-            .config
+        let (major, minor) = config
             .version
             .unwrap_or((spirv::MAJOR_VERSION, spirv::MINOR_VERSION));
         b.set_version(major, minor);
@@ -422,7 +420,7 @@ impl Translate<IR, SPVModule> for SPVModuleBuilder {
             b.execution_mode(
                 spirv_functions[i],
                 spirv::ExecutionMode::LocalSize,
-                &ir.config.local_size,
+                &config.local_size,
             );
         }
 
@@ -431,11 +429,8 @@ impl Translate<IR, SPVModule> for SPVModuleBuilder {
 }
 
 impl IR {
-    pub fn new(config: Config) -> Self {
-        Self {
-            config,
-            ..Default::default()
-        }
+    pub fn new() -> Self {
+        Default::default()
     }
 
     fn types(&self) -> Types {
@@ -1051,7 +1046,7 @@ pub mod test_utils {
     use super::*;
 
     pub fn make_module(config: Config) -> SPVModule {
-        let mut ir = IR::new(config);
+        let mut ir = IR::new();
         let t_f32 = Ty::Scalar(ScalarTy::F32);
         let t_f32_ptr = ir.make_ptr_type(t_f32);
         let t_f32_rt_array = ir
@@ -1148,7 +1143,7 @@ pub mod test_utils {
             ],
         );
 
-        SPVModuleBuilder::default().translate(ir, &()).unwrap()
+        SPVModuleBuilder::default().translate(ir, &config).unwrap()
     }
 }
 

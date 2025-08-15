@@ -5,7 +5,7 @@ use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo,
-    CopyBufferInfoTyped, PrimaryAutoCommandBuffer,
+    PrimaryAutoCommandBuffer,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::layout::DescriptorSetLayout;
@@ -22,7 +22,8 @@ use vulkano::memory::allocator::{
 };
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::layout::{
-    IntoPipelineLayoutCreateInfoError, PipelineLayoutCreateInfo,
+    IntoPipelineLayoutCreateInfoError, PipelineDescriptorSetLayoutCreateInfo,
+    PipelineLayoutCreateInfo,
 };
 use vulkano::pipeline::{
     ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
@@ -62,7 +63,7 @@ pub enum CreateError {
     VulkanPipelineLayout(IntoPipelineLayoutCreateInfoError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MakeBufferError {
     InvalidLayout,
     VulkanAllocateBuffer(vulkano::buffer::AllocateBufferError),
@@ -167,13 +168,24 @@ impl Context {
         )?)
     }
 
-    pub fn make_pipeline(
+    pub fn make_pipeline_layout<'a>(
         &self,
-        entry_point: EntryPoint,
-        layout: PipelineLayoutCreateInfo,
+        stages: impl IntoIterator<Item = &'a PipelineShaderStageCreateInfo>,
+    ) -> Arc<PipelineLayout> {
+        PipelineLayout::new(
+            self.device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(stages)
+                .into_pipeline_layout_create_info(self.device.clone())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    pub fn make_compute_pipeline(
+        &self,
+        stage: PipelineShaderStageCreateInfo,
+        layout: Arc<PipelineLayout>,
     ) -> Result<Arc<ComputePipeline>, MakePipelineError> {
-        let stage = PipelineShaderStageCreateInfo::new(entry_point);
-        let layout = PipelineLayout::new(self.device.clone(), layout)?;
         Ok(ComputePipeline::new(
             self.device.clone(),
             None,
@@ -184,12 +196,12 @@ impl Context {
     pub fn make_descriptor_set(
         &self,
         layout: Arc<DescriptorSetLayout>,
-        buffers: &[Arc<Buffer>],
+        buffers: impl Iterator<Item = Arc<Buffer>>,
     ) -> Result<Arc<DescriptorSet>, Validated<VulkanError>> {
         DescriptorSet::new(
             self.descriptor_set_alloc.clone(),
             layout,
-            buffers.iter().enumerate().map(|(i, buffer)| {
+            buffers.enumerate().map(|(i, buffer)| {
                 WriteDescriptorSet::buffer(
                     i as u32,
                     Into::<Subbuffer<[u8]>>::into(buffer.clone()),

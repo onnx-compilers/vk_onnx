@@ -115,7 +115,6 @@ pub mod componentwise {
 
     #[derive(Debug, Clone)]
     pub struct Config {
-        pub local_size: [u32; 3],
         pub item_type: ScalarTy,
         pub descriptor_set: u32,
         pub bindings: Bindings,
@@ -125,7 +124,6 @@ pub mod componentwise {
     impl Default for Config {
         fn default() -> Self {
             Self {
-                local_size: [1, 1, 1],
                 item_type: ScalarTy::F32,
                 descriptor_set: 0,
                 bindings: Bindings {
@@ -140,7 +138,6 @@ pub mod componentwise {
 
     pub fn new(config: Config) -> IR {
         let Config {
-            local_size,
             item_type: scalar_t_item,
             descriptor_set,
             bindings:
@@ -151,10 +148,7 @@ pub mod componentwise {
                 },
             op,
         } = config;
-        let mut ir = IR::new(crate::shader::l0::Config {
-            local_size,
-            version: Some((1, 3)),
-        });
+        let mut ir = IR::new();
 
         let t_item = scalar_t_item.into();
         let t_u32 = ScalarTy::U32.into();

@@ -246,12 +246,14 @@ impl IR {
         Parameter(i)
     }
 
+    pub fn add_output(&mut self, value: Value) {
+        self.outputs.push(Output { value });
+    }
+
     pub fn append_op(&mut self, op: Operation, result: Argument) -> Temporary {
         let i = self.instructions.len();
         self.instructions.push(Instruction { op, result });
-        let id = Temporary(i);
-        self.outputs.push(Output { value: Value::Temporary(id) });
-        id
+        Temporary(i)
     }
 
     pub fn output_data(&self, idx: usize) -> Option<&Argument> {
@@ -298,11 +300,5 @@ mod tests {
         assert_eq!(ir.inputs.len(), 2);
         assert_eq!(ir.outputs.len(), 1);
         assert_eq!(ir.instructions.len(), 1);
-        // eprintln!("{:#?}", ir);
-        // ir.outputs
-        //     .iter()
-        //     .enumerate()
-        //     .map(|(i, o)| { (o, ir.output_data(i).unwrap()) })
-        //     .for_each(|(o, d)| eprintln!("{:?} -> {:?}", o, d) );
     }
 }
