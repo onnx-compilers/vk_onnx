@@ -2,15 +2,15 @@
 
 layout (local_size_x = 0x100) in;
 
-layout (set = 0, binding = 0) uniform Config {
-  int size;
-} config;
+layout (push_constant) uniform config {
+  int offset;
+} Config;
 
-layout (set = 0, binding = 1) readonly buffer InputBufferA {
+layout (set = 0, binding = 0) readonly buffer InputBufferA {
   int values[];
 } inputA;
 
-layout (set = 0, binding = 2) readonly buffer InputBufferB {
+layout (set = 0, binding = 1) readonly buffer InputBufferB {
   int values[];
 } inputB;
 
@@ -20,17 +20,14 @@ layout (set = 0, binding = 2) buffer OutputBufferC {
 
 int add(const int, const int);
 
-int arr[] = {1, 2, 3, 4};
-
 void main() {
   uint gID = gl_GlobalInvocationID.x;
-  int a = inputA.values[gID];
-  int b = inputB.values[gID];
+  uint offset = Config.offset;
+  uint idx = gID + offset;
+  int a = inputA.values[idx];
+  int b = inputB.values[idx];
   int c = add(a, b);
-  if (gID < config.size) {
-    outputC.values[gID] = c;
-  }
-  int abc[] = {a, b, c};
+  outputC.values[idx] = c;
 }
 
 int add(const int a, const int b) {

@@ -57,7 +57,7 @@ pub struct BinOp<R: PartialEq + Eq> {
 }
 
 #[derive(Default)]
-struct IRBuilder {
+pub struct IRBuilder {
     operations: Vec<Operation>,
     inputs: Vec<Input>,
     outputs: Vec<Output>,
@@ -330,15 +330,10 @@ fn parse_shape(shape: &TensorShapeProto) -> Result<Vec<Option<usize>>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub mod test_utils {
     use std::path::Path;
 
-    use protobuf::Message;
-
-    use crate::protos::onnx::ModelProto;
-
-    fn project_path() -> Box<Path> {
+    pub fn project_path() -> Box<Path> {
         Path::new(file!())
             .parent()
             .unwrap()
@@ -346,6 +341,16 @@ mod tests {
             .unwrap()
             .into()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_utils::project_path;
+
+    use protobuf::Message;
+
+    use crate::protos::onnx::ModelProto;
 
     #[test]
     fn test_translate_simple_add() {

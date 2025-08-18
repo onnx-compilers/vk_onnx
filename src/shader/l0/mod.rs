@@ -15,6 +15,7 @@ pub struct IR {
     constants: Vec<Constant>,
     storage_buffers: Vec<StorageBuffer>,
     uniforms: Vec<Uniform>,
+    push_constants: Vec<PushConstant>,
     builtins: Vec<(PtrTyId, spirv::BuiltIn)>,
     composite_types: Vec<CompositeTy>,
     ptr_types: Vec<Ty>,
@@ -47,6 +48,11 @@ pub struct Uniform {
     pub ty: PtrTyId,
     pub descriptor_set: u32,
     pub binding: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushConstant {
+    pub ty: PtrTyId,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -98,6 +104,8 @@ pub struct StorageBufferId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UniformId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushConstantId(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinId(pub usize); // NOTE: Maybe use an enum for this
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
@@ -113,6 +121,7 @@ pub enum Variable {
     Builtin(BuiltinId),
     StorageBuffer(StorageBufferId),
     Uniform(UniformId),
+    PushConstant(PushConstantId),
 }
 
 impl From<Parameter> for Value {
@@ -151,6 +160,12 @@ impl From<UniformId> for Value {
     }
 }
 
+impl From<PushConstantId> for Value {
+    fn from(v: PushConstantId) -> Self {
+        Value::Variable(Variable::PushConstant(v))
+    }
+}
+
 impl From<BuiltinId> for Value {
     fn from(v: BuiltinId) -> Self {
         Value::Variable(Variable::Builtin(v))
@@ -172,6 +187,12 @@ impl From<StorageBufferId> for Variable {
 impl From<UniformId> for Variable {
     fn from(v: UniformId) -> Self {
         Variable::Uniform(v)
+    }
+}
+
+impl From<PushConstantId> for Variable {
+    fn from(v: PushConstantId) -> Self {
+        Variable::PushConstant(v)
     }
 }
 
@@ -219,6 +240,7 @@ struct ShaderScope<'a> {
     builtins: &'a [Word],
     storage_buffers: &'a [Word],
     uniforms: &'a [Word],
+    push_constants: &'a [Word],
 }
 
 struct FunctionCompiler<'a> {
@@ -356,6 +378,23 @@ impl Translate<IR, SPVModule> for SPVModuleBuilder {
             )
             .collect::<Box<[_]>>();
 
+        let push_constant_ids = ir
+            .push_constants
+            .iter()
+            .map(|&PushConstant { ty }| {
+                let ty_id = type_mapper.get_ptr(
+                    &mut b,
+                    ir.types(),
+                    &constant_ids,
+                    ty,
+                    StorageClass::PushConstant,
+                );
+                let id =
+                    b.variable(ty_id, None, StorageClass::PushConstant, None);
+                id
+            })
+            .collect::<Box<[_]>>();
+
         let builtin_ids = ir
             .builtins
             .iter()
@@ -391,6 +430,7 @@ impl Translate<IR, SPVModule> for SPVModuleBuilder {
                     storage_buffers: &storage_buffer_ids,
                     uniforms: &uniform_ids,
                     builtins: &builtin_ids,
+                    push_constants: &push_constant_ids,
                 },
             )?
             .compile(&mut b)?;
@@ -412,6 +452,9 @@ impl Translate<IR, SPVModule> for SPVModuleBuilder {
                             storage_buffer_ids[i]
                         }
                         Variable::Builtin(BuiltinId(i)) => builtin_ids[i],
+                        Variable::PushConstant(PushConstantId(i)) => {
+                            push_constant_ids[i]
+                        }
                         _ => todo!(),
                     })
                     .collect::<Box<[_]>>(),
@@ -465,6 +508,15 @@ impl IR {
         let id = self.storage_buffers.len();
         self.uniforms.push(uniform);
         UniformId(id)
+    }
+
+    pub fn make_push_constant(
+        &mut self,
+        push_constant: PushConstant,
+    ) -> PushConstantId {
+        let id = self.push_constants.len();
+        self.push_constants.push(push_constant);
+        PushConstantId(id)
     }
 
     pub fn make_builtin(
@@ -673,6 +725,9 @@ impl<'a> FunctionCompiler<'a> {
                 self.scope.builtins[i]
             }
             Value::Constant(ConstantId(i)) => self.scope.constants[i],
+            Value::Variable(Variable::PushConstant(PushConstantId(i))) => {
+                self.scope.push_constants[i]
+            }
         }
     }
 

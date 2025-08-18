@@ -9,61 +9,61 @@ pub mod componentwise {
     //!  (define-struct Bindings ([inputs (Array 2 U32)]
     //!                           [output U32]
     //!                           [config U32]))
-    //! 
+    //!
     //!  (define-enum Op (Add))
-    //! 
+    //!
     //!  (define-struct TemplateConfig ([local-size (Array 3 U32)]
     //!                                 [item-type ScalarTy]
     //!                                 [descriptor-set U32]
     //!                                 [bindings Bindings]
     //!                                 [op Op])
     //!    #:symbol "Config")
-    //! 
+    //!
     //!  (configuration TemplateConfig))
-    //! 
+    //!
     //! (define-type U32 (#%type 'u32))
     //! (define-type U32-Vec3 (Vec U32 3))
     //! (define-type T-RTArray (RTArray (#%get item-type)))
-    //! 
+    //!
     //! (define-struct Input ([values T-RTArray]) #:writable #f)
-    //! 
+    //!
     //! (define-struct Output ([values T-RTArray]) #:writable #t)
-    //! 
+    //!
     //! (define-struct Config ([offset U32]) #:writable #f #:export "KernelConfig")
-    //! 
+    //!
     //! (version 460)
     //! (local-size (#%get local-size))
-    //! 
+    //!
     //! (define global-invocation-id (#%builtin U32-Vec3 'GlobalInvocationId))
-    //! 
+    //!
     //! (define input-a
     //!   (#%storage-buffer Input
     //!                     #:layout (#%layout #:set (#%get descriptor-set)
     //!                                        #:binding (#%get bindings inputs 0))
     //!                     #:writable #f))
-    //! 
+    //!
     //! (define input-b
     //!   (#%storage-buffer Input
     //!                     #:layout (#%layout #:set (#%get descriptor-set)
     //!                                        #:binding (#%get bindings inputs 1))
     //!                     #:writable #f))
-    //! 
+    //!
     //! (define output
     //!   (#%storage-buffer Output
     //!                     #:layout (#%layout #:set (#%get descriptor-set)
     //!                                        #:binding (#%get bindings output))
     //!                     #:writable #t))
-    //! 
-    //! 
+    //!
+    //!
     //! (define config
-    //!   (#%uniform Config
-    //!              #:layout (#%layout #:set (#%get descriptor-set)
-    //!                                 #:binding (#%get bindings config))
-    //!              #:writable #f))
-    //! 
+    //!   (#%push-constant Config
+    //!                    #:layout (#%layout #:set (#%get descriptor-set)
+    //!                                       #:binding (#%get bindings config))
+    //!                    #:writable #f))
+    //!
     //! (interface
     //!  global-invocation-id input-a input-b output config)
-    //! 
+    //!
     //! (define (main)
     //!   (define idx (+i (load@ global-invocation-id x)
     //!                  (load@ config offset)))
@@ -77,8 +77,9 @@ pub mod componentwise {
     use crate::{
         l_base::ScalarTy,
         shader::l0::{
-            CompositeTy, Constant, Function, Node, ScalarConstant,
-            StorageBuffer, StructMember, Ty, Uniform, ValueNode,
+            CompositeTy, Constant, Function, Node, PushConstant,
+            ScalarConstant, StorageBuffer, StructMember, Ty, ValueNode,
+            Variable,
         },
     };
     use rspirv::spirv::{BuiltIn, StorageClass};
@@ -104,7 +105,6 @@ pub mod componentwise {
     pub struct Bindings {
         pub inputs: [u32; 2],
         pub output: u32,
-        pub config: u32,
     }
 
     #[derive(Debug, Clone, BufferContents)]
@@ -129,7 +129,6 @@ pub mod componentwise {
                 bindings: Bindings {
                     inputs: [0, 1],
                     output: 2,
-                    config: 3,
                 },
                 op: Op::Add,
             }
@@ -144,7 +143,6 @@ pub mod componentwise {
                 Bindings {
                     inputs: input_bindings,
                     output: output_binding,
-                    config: config_binding,
                 },
             op,
         } = config;
@@ -195,11 +193,10 @@ pub mod componentwise {
             .make_constant(Constant::Scalar(ScalarConstant::U32(0)))
             .into();
 
-        let global_invocation_id = ir
-            .make_builtin(t_u32_vec3_ptr, BuiltIn::GlobalInvocationId)
-            .into();
+        let global_invocation_id =
+            ir.make_builtin(t_u32_vec3_ptr, BuiltIn::GlobalInvocationId);
 
-        let inputs = input_bindings.map(|binding| {
+        let inputs = input_bindings.map(|binding| -> Variable {
             ir.make_storage_buffer(StorageBuffer {
                 ty: t_input_ptr,
                 descriptor_set,
@@ -208,7 +205,7 @@ pub mod componentwise {
             })
             .into()
         });
-        let output = ir
+        let output: Variable = ir
             .make_storage_buffer(StorageBuffer {
                 ty: t_output_ptr,
                 descriptor_set,
@@ -216,12 +213,8 @@ pub mod componentwise {
                 writable: true,
             })
             .into();
-        let config = ir
-            .make_uniform(Uniform {
-                ty: t_config_ptr,
-                descriptor_set,
-                binding: config_binding,
-            })
+        let config: Variable = ir
+            .make_push_constant(PushConstant { ty: t_config_ptr })
             .into();
 
         let mut main = Function::new(Some("main".into()), None);
@@ -230,7 +223,7 @@ pub mod componentwise {
             .append_value_node(ValueNode::access(
                 t_u32_ptr,
                 StorageClass::Input,
-                global_invocation_id,
+                global_invocation_id.into(),
                 [const_u32_0],
             ))
             .into();
@@ -242,7 +235,7 @@ pub mod componentwise {
             .append_value_node(ValueNode::access(
                 t_u32_ptr,
                 StorageClass::Uniform,
-                config,
+                config.into(),
                 [const_u32_0],
             ))
             .into();
@@ -258,7 +251,7 @@ pub mod componentwise {
                 .append_value_node(ValueNode::access(
                     t_item_ptr,
                     StorageClass::StorageBuffer,
-                    input,
+                    input.into(),
                     [const_u32_0, idx],
                 ))
                 .into();
@@ -277,12 +270,23 @@ pub mod componentwise {
         let c_ptr = main.append_value_node(ValueNode::access(
             t_item_ptr,
             StorageClass::StorageBuffer,
-            output,
+            output.into(),
             [const_u32_0, idx],
         ));
 
         main.append_node(Node::Store(c_ptr.into(), c.into()));
         main.append_node(Node::Return);
+        let main_id = ir.make_function(main);
+        ir.entry_point(
+            main_id,
+            [
+                global_invocation_id.into(),
+                inputs[0],
+                inputs[1],
+                output,
+                config,
+            ],
+        );
 
         ir
     }

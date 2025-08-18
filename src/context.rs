@@ -1,7 +1,9 @@
 use std::alloc::Layout;
 use std::sync::Arc;
 
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::buffer::{
+    Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer,
+};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo,
@@ -23,13 +25,12 @@ use vulkano::memory::allocator::{
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::layout::{
     IntoPipelineLayoutCreateInfoError, PipelineDescriptorSetLayoutCreateInfo,
-    PipelineLayoutCreateInfo,
 };
 use vulkano::pipeline::{
     ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 use vulkano::{Validated, Version, VulkanError, VulkanLibrary};
 
 #[derive(Debug)]
@@ -242,6 +243,9 @@ impl Context {
         pipeline: Arc<ComputePipeline>,
         descriptor_sets: impl Iterator<Item = Arc<DescriptorSet>>,
         first_set: u32,
+        push_constants: impl BufferContents,
+        push_constants_offset: u32,
+        group_counts: [u32; 3],
     ) -> Result<Arc<PrimaryAutoCommandBuffer>, Validated<VulkanError>> {
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_alloc.clone(),
@@ -249,7 +253,7 @@ impl Context {
             CommandBufferUsage::MultipleSubmit,
         )?;
         let layout = pipeline.layout().clone();
-        let _ = builder.bind_pipeline_compute(pipeline)?;
+        let _ = builder.bind_pipeline_compute(pipeline.clone())?;
         for descriptor_set in descriptor_sets {
             let _ = builder.bind_descriptor_sets(
                 PipelineBindPoint::Compute,
@@ -258,6 +262,12 @@ impl Context {
                 descriptor_set,
             )?;
         }
+        let _ = builder.push_constants(
+            pipeline.layout().clone(),
+            push_constants_offset,
+            push_constants,
+        )?;
+        let _ = unsafe { builder.dispatch(group_counts) }?;
         builder.build()
     }
 }

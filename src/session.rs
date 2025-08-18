@@ -1,13 +1,14 @@
 use std::alloc::{Layout, LayoutError};
-// use std::collections::HashSet;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vulkano::buffer::{Buffer, BufferUsage, Subbuffer};
+use replace_with::replace_with_or_abort;
+use vulkano::buffer::{Buffer, BufferContents, BufferUsage};
 use vulkano::command_buffer::PrimaryAutoCommandBuffer;
-use vulkano::pipeline::{ComputePipeline, PipelineShaderStageCreateInfo};
+use vulkano::device::DeviceOwned;
+use vulkano::pipeline::PipelineShaderStageCreateInfo;
 use vulkano::shader::EntryPoint;
-// use vulkano::pipeline::ComputePipeline;
 use vulkano::sync::GpuFuture;
 use vulkano::{Validated, VulkanError};
 
@@ -18,36 +19,26 @@ use crate::pipeline;
 #[derive(Debug)]
 pub struct Session {
     ctx: Arc<Context>,
-    pub input_buffers: Vec<InputBuffer>,
-    pub output_buffers: Vec<OutputBuffer>,
+    pub input_buffers: Vec<BufferId>,
+    pub output_buffers: Vec<BufferId>,
+    // NOTE: Maybe keep just the input and output buffers
     buffers: Vec<Arc<Buffer>>,
+    instructions: Vec<Instruction>,
     stages: Vec<GPUStage>,
-    stage_inputs_pool: Vec<BufferId>,
-    stage_outputs_pool: Vec<BufferId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferId(pub usize);
 
 #[derive(Debug)]
-pub struct InputBuffer {
-    pub src: Arc<Buffer>,
-    pub dst: BufferId,
-    pub copy_command: Arc<PrimaryAutoCommandBuffer>,
-}
-
-#[derive(Debug)]
-pub struct OutputBuffer {
-    pub src: BufferId,
-    pub dst: Arc<Buffer>,
-    pub copy_command: Arc<PrimaryAutoCommandBuffer>,
-}
-
-#[derive(Debug)]
 struct GPUStage {
-    pipeline: Arc<ComputePipeline>,
-    inputs_range: (usize, usize),
-    outputs_range: (usize, usize),
+    // pipeline: Arc<ComputePipeline>,
+    command_buffer: Arc<PrimaryAutoCommandBuffer>,
+}
+
+#[derive(Debug)]
+pub enum Instruction {
+    Invoke(StageId),
 }
 
 pub struct Run<'a> {
@@ -56,7 +47,7 @@ pub struct Run<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PipelineId(pub usize);
+pub struct StageId(pub usize);
 
 #[derive(Debug, Clone)]
 pub enum MakeInputBufferError {
@@ -101,10 +92,13 @@ impl Session {
             input_buffers: Vec::new(),
             output_buffers: Vec::new(),
             buffers: Vec::new(),
+            instructions: Vec::new(),
             stages: Vec::new(),
-            stage_inputs_pool: Vec::new(),
-            stage_outputs_pool: Vec::new(),
         }
+    }
+
+    pub fn get_buffer(&self, BufferId(i): BufferId) -> &Arc<Buffer> {
+        &self.buffers[i]
     }
 
     pub fn make_run(&mut self) -> Run {
@@ -131,58 +125,139 @@ impl Session {
         Ok((buf, BufferId(i)))
     }
 
-    pub fn make_input_buffer(
-        &mut self,
-        layout: Layout,
-    ) -> Result<(Arc<Buffer>, BufferId), MakeInputBufferError> {
-        let (src, src_id) = self.make_storage_buffer(layout, Some(true))?;
-        let (dst, dst_id) = self.make_storage_buffer(layout, Some(false))?;
-        let cmd = self.ctx.make_buffer_copy_command(
-            Into::<Subbuffer<[u8]>>::into(src.clone()),
-            Into::<Subbuffer<[u8]>>::into(dst.clone()),
-        )?;
-        self.buffers.push(dst.clone());
-        self.input_buffers.push(InputBuffer {
-            src: src.clone(),
-            dst: dst_id,
-            copy_command: cmd,
-        });
-        Ok((src, src_id))
-    }
-
     pub fn make_stage(
         &mut self,
         entry_point: EntryPoint,
         inputs: &[BufferId],
         outputs: &[BufferId],
-    ) {
+        push_constants: impl BufferContents,
+        // push_constants_offset: u32,
+    ) -> StageId {
         let stage = PipelineShaderStageCreateInfo::new(entry_point);
         let layout = self.ctx.make_pipeline_layout([&stage]);
         let pipeline = self
             .ctx
             .make_compute_pipeline(stage, layout.clone())
             .unwrap();
-        let inputs_range = self.make_inputs_range(inputs);
-        let outputs_range = self.make_outputs_range(outputs);
+        let descriptor_set = self
+            .ctx
+            .make_descriptor_set(
+                layout.set_layouts()[0].clone(),
+                inputs
+                    .iter()
+                    .map(|&BufferId(i)| self.buffers[i].clone())
+                    .chain(
+                        outputs
+                            .iter()
+                            .map(|&BufferId(i)| self.buffers[i].clone()),
+                    ),
+            )
+            .unwrap();
+        let command_buffer = self
+            .ctx
+            .make_compute_pipeline_command(
+                pipeline.clone(),
+                [descriptor_set].into_iter(),
+                0,
+                push_constants,
+                0,
+                [1, 1, 1],
+            )
+            .unwrap();
+        let i = self.stages.len();
         self.stages.push(GPUStage {
-            pipeline,
-            inputs_range,
-            outputs_range,
-        })
+            // pipeline,
+            command_buffer,
+        });
+        StageId(i)
+    }
+}
+
+struct X<F: GpuFuture> {
+    next: F,
+}
+
+unsafe impl<F: GpuFuture> DeviceOwned for X<F> {
+    fn device(&self) -> &Arc<vulkano::device::Device> {
+        self.next.device()
+    }
+}
+
+unsafe impl<F: GpuFuture> GpuFuture for X<F> {
+    fn cleanup_finished(&mut self) {
+        eprintln!("X cleanup_finished");
+        self.next.cleanup_finished();
     }
 
-    fn make_inputs_range(&mut self, inputs: &[BufferId]) -> (usize, usize) {
-        let start = self.stage_inputs_pool.len();
-        let end = start + inputs.len();
-        self.stage_inputs_pool.extend_from_slice(inputs);
-        (start, end)
+    unsafe fn build_submission(
+        &self,
+    ) -> Result<vulkano::sync::future::SubmitAnyBuilder, Validated<VulkanError>>
+    {
+        eprintln!("X build_submission");
+        unsafe { self.next.build_submission() }
     }
 
-    fn make_outputs_range(&mut self, outputs: &[BufferId]) -> (usize, usize) {
-        let start = self.stage_outputs_pool.len();
-        let end = start + outputs.len();
-        self.stage_outputs_pool.extend_from_slice(outputs);
-        (start, end)
+    fn flush(&self) -> Result<(), Validated<VulkanError>> {
+        eprintln!("X flush");
+        self.next.flush()
+    }
+
+    unsafe fn signal_finished(&self) {
+        eprintln!("X signal_finished");
+        unsafe {
+            self.next.signal_finished();
+        }
+    }
+
+    fn queue(&self) -> Option<Arc<vulkano::device::Queue>> {
+        eprintln!("X queue");
+        self.next.queue()
+    }
+
+    fn queue_change_allowed(&self) -> bool {
+        eprintln!("X queue_change_allowed");
+        self.next.queue_change_allowed()
+    }
+
+    fn check_buffer_access(
+        &self,
+        buffer: &Buffer,
+        range: std::ops::Range<vulkano::DeviceSize>,
+        exclusive: bool,
+        queue: &vulkano::device::Queue,
+    ) -> Result<(), vulkano::sync::future::AccessCheckError> {
+        eprintln!("X check_buffer_access");
+        self.next
+            .check_buffer_access(buffer, range, exclusive, queue)
+    }
+
+    fn check_image_access(
+        &self,
+        image: &vulkano::image::Image,
+        range: std::ops::Range<vulkano::DeviceSize>,
+        exclusive: bool,
+        expected_layout: vulkano::image::ImageLayout,
+        queue: &vulkano::device::Queue,
+    ) -> Result<(), vulkano::sync::future::AccessCheckError> {
+        eprintln!("X check_image_access");
+        self.next.check_image_access(
+            image,
+            range,
+            exclusive,
+            expected_layout,
+            queue,
+        )
+    }
+
+    fn check_swapchain_image_acquired(
+        &self,
+        swapchain: &vulkano::swapchain::Swapchain,
+        image_index: u32,
+        before: bool,
+    ) -> Result<(), vulkano::sync::future::AccessCheckError> {
+        eprintln!("X check_swapchain_image_acquired");
+        self.next
+            .check_swapchain_image_acquired(swapchain, image_index, before)
     }
 }
 
@@ -193,24 +268,35 @@ impl<'a> Run<'a> {
     ) -> Self {
         Self {
             session,
-            future: future.into(),
+            future: Box::new(X {
+                next: future.into(),
+            }),
         }
     }
 
-    pub fn transfer_inputs(&mut self, _diff: impl Iterator<Item = bool>) {
-        todo!(
-            "dispatch commands for copying to the buffer according to the diff"
-        )
-    }
-
     pub fn run(&mut self) {
-        todo!("dispatch commands to run the vulkan pipelines")
-    }
-
-    pub fn transfer_outputs(&mut self, _diff: impl Iterator<Item = bool>) {
-        todo!(
-            "dispatch commands to transfer the data from the device buffers to the host"
-        )
+        for instr in self.session.instructions.iter() {
+            match instr {
+                &Instruction::Invoke(StageId(i)) => {
+                    eprintln!("INVOKING STAGE {}", i);
+                    replace_with_or_abort(&mut self.future, |future| {
+                        Box::new(
+                            future
+                                .then_execute(
+                                    self.session.ctx.queue.clone(),
+                                    self.session.stages[i]
+                                        .command_buffer
+                                        .clone(),
+                                )
+                                .unwrap(),
+                        )
+                    });
+                }
+            }
+        }
+        replace_with_or_abort(&mut self.future, |future| {
+            Box::new(X { next: future })
+        });
     }
 
     pub fn wait(
@@ -265,76 +351,39 @@ impl From<MakeInputBufferError> for TranslationError {
 #[derive(Debug)]
 pub struct SessionBuilder {
     session: Session,
+    outputs: HashSet<pipeline::OperandBufferId>,
 }
 
 impl SessionBuilder {
     pub fn new(ctx: Arc<Context>) -> Self {
         Self {
             session: Session::new(ctx),
+            outputs: HashSet::new(),
         }
-    }
-
-    fn make_buffer(
-        &mut self,
-        ir: &pipeline::IR,
-        buffer: &pipeline::Buffer,
-    ) -> Result<
-        (Arc<Buffer>, BufferId),
-        <Self as Translate<pipeline::IR, Session>>::Error,
-    > {
-        Ok(self.make_raw_buffer(Layout::array::<u8>(
-            ir.get_shape(buffer.dims_range).iter().product::<usize>()
-                * size_of(buffer.ty),
-        )?)?)
-    }
-
-    fn make_raw_buffer(
-        &mut self,
-        layout: Layout,
-    ) -> Result<(Arc<Buffer>, BufferId), MakeBufferError> {
-        self.session.make_storage_buffer(layout, None)
-    }
-
-    fn make_input_buffer(
-        &mut self,
-        ir: &pipeline::IR,
-        buffer: &pipeline::Buffer,
-    ) -> Result<
-        (Arc<Buffer>, BufferId),
-        <Self as Translate<pipeline::IR, Session>>::Error,
-    > {
-        Ok(self.session.make_input_buffer(Layout::array::<u8>(
-            ir.get_shape(buffer.dims_range).iter().product::<usize>()
-                * size_of(buffer.ty),
-        )?)?)
     }
 
     fn op_add_elementwise_notinplace(
         &mut self,
         ir: &pipeline::IR,
-        lhs: &pipeline::Buffer,
-        rhs: &pipeline::Buffer,
-        result: &pipeline::Buffer,
-    ) -> Result<(), <Self as Translate<pipeline::IR, Session>>::Error> {
+        lhs: BufferId,
+        rhs: BufferId,
+        result: BufferId,
+        ty: ScalarTy,
+        dims_range: (usize, usize),
+    ) -> Result<BufferId, <Self as Translate<pipeline::IR, Session>>::Error>
+    {
         use crate::kernel::componentwise::{
             self, Bindings, Config, KernelConfig, Op,
         };
         use crate::shader::l0::{Config as ShaderConfig, SPVModuleBuilder};
-        use rspirv::binary::Assemble;
+        use rspirv::binary::{Assemble, Disassemble};
 
-        let (lhs_buf, lhs_id) = self.make_input_buffer(ir, lhs)?;
-        let (rhs_buf, rhs_id) = self.make_input_buffer(ir, rhs)?;
-        let (result_buf, result_id) = self.make_buffer(ir, result)?;
-        // TODO: Have these as constant buffers. Or reuse them.
-        let (config_buf, config_id) =
-            self.make_raw_buffer(Layout::new::<KernelConfig>())?;
         let shader_ir = componentwise::new(Config {
-            item_type: lhs.ty,
+            item_type: ty,
             descriptor_set: 0,
             bindings: Bindings {
                 inputs: [0, 1],
                 output: 2,
-                config: 3,
             },
             op: Op::Add,
         });
@@ -343,30 +392,29 @@ impl SessionBuilder {
                 shader_ir,
                 &ShaderConfig {
                     local_size: [
-                        ir.get_shape(lhs.dims_range).iter().product::<usize>()
+                        ir.get_shape(dims_range).iter().product::<usize>()
                             as u32,
                         1,
                         1,
                     ],
-                    ..Default::default()
+                    version: Some((1, 3)),
                 },
             )
             .unwrap();
+        eprintln!("{}", rspirv_ir.disassemble());
         let spirv = rspirv_ir.assemble();
         let shader =
             unsafe { self.session.ctx.shader_from_spirv(spirv.as_slice()) }
                 .map_err(TranslationError::ShaderFromSpirV)?;
         let entry_point = shader.entry_point("main").unwrap();
-        self.session.make_stage(
+        let stage = self.session.make_stage(
             entry_point,
-            &[lhs_id, rhs_id, config_id],
-            &[result_id],
+            &[lhs, rhs],
+            &[result],
+            KernelConfig { offset: 0 },
         );
-        // TODO: [2025-08-16 00:01] Do the `TRANSFER_SRC` and `TRANSFER_DST`
-        // song and dance for the config. Maybe an
-        // `enum Op { Invoke(StageId), Copy(BufferId, SomeT) }`.
-        // Look at constants and stuff.
-        Ok(())
+        self.session.instructions.push(Instruction::Invoke(stage));
+        Ok(result)
     }
 }
 
@@ -387,22 +435,29 @@ impl Translate<pipeline::IR, Session> for SessionBuilder {
             .buffers
             .reserve(ir.inputs.len() + ir.outputs.len());
 
-        // let mut input_buffer_set = HashSet::new();
-        for &input in ir.inputs.iter() {
-            let &pipeline::Buffer { ty, dims_range } = ir.get_operand(input);
+        self.outputs.reserve(ir.outputs.len());
+        for &output in ir.outputs.iter() {
+            self.outputs.insert(output);
+        }
+
+        for &pipeline::Buffer { ty, dims_range } in ir.operand_buffers.iter() {
             let element_count: usize =
                 ir.dims_pool[dims_range.0..dims_range.1].iter().product();
             let size = element_count * size_of(ty);
-            let _buffer =
-                self.session.make_input_buffer(Layout::array::<u8>(size)?)?;
-            // input_buffer_set.insert(input);
+            let _buffer = self
+                .session
+                .make_storage_buffer(Layout::array::<u8>(size)?, None)?;
+        }
+
+        for &pipeline::OperandBufferId(i) in ir.inputs.iter() {
+            self.session.input_buffers.push(BufferId(i));
         }
 
         for instr in ir.instructions.iter() {
             match instr {
                 &Instr::Op(pipeline::OpId(i)) => {
                     // TODO: Put this in a function or smth
-                    match &ir.operations[i] {
+                    let outputs = match &ir.operations[i] {
                         &pipeline::Op::Binary(pipeline::BinOp {
                             kind: pipeline::BinOpKind::AddElementwise,
                             operands:
@@ -412,14 +467,25 @@ impl Translate<pipeline::IR, Session> for SessionBuilder {
                                     result,
                                 },
                         }) => {
-                            let lhs = ir.get_operand(lhs);
-                            let rhs = ir.get_operand(rhs);
-                            let result = ir.get_operand(result);
-                            self.op_add_elementwise_notinplace(
-                                &ir, lhs, rhs, result,
+                            let pipeline::OperandBufferId(lhs_i) = lhs;
+                            let pipeline::OperandBufferId(rhs_i) = rhs;
+                            let pipeline::OperandBufferId(result_i) = result;
+                            let lhs_id = BufferId(lhs_i);
+                            let rhs_id = BufferId(rhs_i);
+                            let result_id = BufferId(result_i);
+                            let &pipeline::Buffer { ty, dims_range } =
+                                ir.get_operand(lhs);
+                            let output = self.op_add_elementwise_notinplace(
+                                &ir, lhs_id, rhs_id, result_id, ty, dims_range,
                             )?;
+                            [(result, output)].into_iter()
                         }
                         op => todo!("unimplemented operation: {:#?}", op),
+                    };
+                    for (output, buffer_id) in outputs {
+                        if self.outputs.contains(&output) {
+                            self.session.output_buffers.push(buffer_id);
+                        }
                     }
                 } // _ => todo!("unimplemented instruction: {:#?}", instr)
             }
@@ -436,7 +502,12 @@ fn size_of(_ty: ScalarTy) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use protobuf::Message;
+    use vulkano::buffer::Subbuffer;
+
     use crate::context::Config;
+    use crate::protos::onnx::ModelProto;
+    use crate::{l0, l1};
 
     use super::*;
 
@@ -449,7 +520,65 @@ mod tests {
             })
             .unwrap(),
         );
-        let session = Session::new(ctx);
+
+        let model_path = l0::test_utils::project_path()
+            .join("test_models")
+            .join("simple_add.onnx");
+        let bytes = std::fs::read(model_path).unwrap();
+        let model = ModelProto::parse_from_bytes(bytes.as_slice()).unwrap();
+
+        let mut session = SessionBuilder::new(ctx)
+            .translate(
+                pipeline::IRBuilder::default()
+                    .translate(
+                        l1::IRBuilder::default().translate(
+                            l0::IRBuilder::default()
+                                .translate(model, &())
+                                .unwrap(),
+                            &(),
+                        ).unwrap(),
+                        &(),
+                    )
+                    .unwrap(),
+                &(),
+            )
+            .unwrap();
+
+        eprintln!("INPUTS: {:?}", session.input_buffers);
+        eprintln!("OUTPUTS: {:?}", session.output_buffers);
+
+        let a = Into::<Subbuffer<_>>::into(
+            session.get_buffer(session.input_buffers[0]).clone(),
+        )
+        .reinterpret::<[f32]>();
+        let b = Into::<Subbuffer<_>>::into(
+            session.get_buffer(session.input_buffers[1]).clone(),
+        )
+        .reinterpret::<[f32]>();
+
+        {
+            let mut a_access = a.write().unwrap();
+            let mut b_access = b.write().unwrap();
+            for i in 0..a_access.len() {
+                a_access[i] = (i + 1) as f32;
+                b_access[i] = (a_access.len() - i) as f32;
+            }
+            eprintln!("{:?} {:?}", &a_access[..], &b_access[..]);
+        }
+
+        let mut run = session.make_run();
+        run.run();
+        let () = run.wait(None).unwrap();
+
+        eprintln!("INPUTS: {:?}", session.input_buffers);
+        eprintln!("OUTPUTS: {:?}", session.output_buffers);
+
+        for (i, buffer) in session.buffers.iter().enumerate() {
+            let subbuffer = Into::<Subbuffer<_>>::into(buffer.clone())
+                .reinterpret::<[f32]>();
+            let access = subbuffer.read().unwrap();
+            eprintln!("{:?}: {:?}", BufferId(i), &access[..]);
+        }
     }
 
     // #[test]

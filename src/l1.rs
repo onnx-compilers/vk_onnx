@@ -50,7 +50,7 @@ pub enum BatchDimension {
 }
 
 #[derive(Debug, Default, Clone)]
-struct IRBuilder {
+pub struct IRBuilder {
     inputs: Vec<Argument>,
     instructions: Vec<Instruction>,
 }
