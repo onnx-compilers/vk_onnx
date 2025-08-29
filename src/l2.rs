@@ -4,7 +4,7 @@ use crate::l1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Buffer {
     pub ty: ScalarTy,
-    pub dims_range: (usize, usize)
+    pub dims_range: (usize, usize),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -31,13 +31,31 @@ pub enum Instr {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Op {
-    // Unary(UnOp),
+    Unary(UnOp),
     Binary(BinOp),
 }
 
-// pub enum UnOp {
-//
-// }
+#[derive(Debug, Clone, Copy)]
+pub struct UnOp {
+    pub kind: UnOpKind,
+    pub operand: UnOperand,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnOpKind {
+    Scaler { offset: f32, scale: f32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnOperand {
+    Inplace {
+        operand: OperandBufferId,
+    },
+    NotInplace {
+        result: OperandBufferId,
+        operand: BufferId,
+    },
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BinOp {
@@ -168,7 +186,7 @@ impl Translate<l1::IR, IR> for IRBuilder {
         for &l1::Argument { ty, ref shape } in l1.inputs.iter() {
             let buffer = Buffer {
                 ty,
-                dims_range: ir.add_dimensions(shape)
+                dims_range: ir.add_dimensions(shape),
             };
             let (src_id, buf_id) = ir.make_input(buffer);
             self.inputs.push((src_id, buf_id));
@@ -180,17 +198,10 @@ impl Translate<l1::IR, IR> for IRBuilder {
         } in l1.instructions.iter()
         {
             let dims_range = ir.add_dimensions(shape);
-            let buf = ir.make_operand_buffer(Buffer {
-                ty,
-                dims_range,
-            });
+            let buf = ir.make_operand_buffer(Buffer { ty, dims_range });
             self.intermediates.push(buf);
             let op = match l1_op {
-                &l1::Operation::BinOp(l1::BinOp {
-                    kind: l1::BinOpKind::Add,
-                    lhs,
-                    rhs,
-                }) => {
+                &l1::Operation::Add { lhs, rhs } => {
                     let lhs = self.get_value(lhs).unwrap();
                     let rhs = self.get_value(rhs).unwrap();
                     Op::Binary(BinOp {
@@ -199,6 +210,21 @@ impl Translate<l1::IR, IR> for IRBuilder {
                             lhs,
                             rhs,
                             result: buf,
+                        },
+                    })
+                }
+
+                &l1::Operation::Scaler {
+                    input,
+                    offset,
+                    scale,
+                } => {
+                    let input = self.get_value(input).unwrap();
+                    Op::Unary(UnOp {
+                        kind: UnOpKind::Scaler { offset, scale },
+                        operand: UnOperand::NotInplace {
+                            result: buf,
+                            operand: input,
                         },
                     })
                 }
@@ -222,7 +248,7 @@ impl Translate<l1::IR, IR> for IRBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::l1::{Argument, BinOp, BinOpKind, Operation};
+    use crate::l1::{Argument, Operation};
 
     use super::*;
 
@@ -238,18 +264,16 @@ mod tests {
             shape: Box::new([2, 2]),
         });
         let c = l1.append_op(
-            Operation::BinOp(BinOp {
-                kind: BinOpKind::Add,
+            Operation::Add {
                 lhs: a.into(),
                 rhs: b.into(),
-            }),
+            },
             Argument {
                 ty: ScalarTy::F32,
                 shape: Box::new([2, 2]),
             },
         );
         l1.add_output(c.into());
-        let ir = IRBuilder::default().translate(l1, &()).unwrap();
-        println!("{:?}", ir);
+        let _ir = IRBuilder::default().translate(l1, &()).unwrap();
     }
 }

@@ -14,7 +14,7 @@ use vulkano::{Validated, VulkanError};
 
 use crate::context::{Context, MakeBufferError};
 use crate::l_base::{ScalarTy, Translate};
-use crate::pipeline;
+use crate::l2;
 
 #[derive(Debug)]
 pub struct Session {
@@ -101,7 +101,7 @@ impl Session {
         &self.buffers[i]
     }
 
-    pub fn make_run(&mut self) -> Run {
+    pub fn make_run<'a>(&'a mut self) -> Run<'a> {
         Run::new(self, vulkano::sync::now(self.ctx.device.clone()).boxed())
     }
 
@@ -132,6 +132,7 @@ impl Session {
         outputs: &[BufferId],
         push_constants: impl BufferContents,
         // push_constants_offset: u32,
+        group_size: [u32; 3],
     ) -> StageId {
         let stage = PipelineShaderStageCreateInfo::new(entry_point);
         let layout = self.ctx.make_pipeline_layout([&stage]);
@@ -161,7 +162,7 @@ impl Session {
                 0,
                 push_constants,
                 0,
-                [1, 1, 1],
+                group_size,
             )
             .unwrap();
         let i = self.stages.len();
@@ -175,6 +176,7 @@ impl Session {
 
 struct X<F: GpuFuture> {
     next: F,
+    first: bool,
 }
 
 unsafe impl<F: GpuFuture> DeviceOwned for X<F> {
@@ -193,29 +195,29 @@ unsafe impl<F: GpuFuture> GpuFuture for X<F> {
         &self,
     ) -> Result<vulkano::sync::future::SubmitAnyBuilder, Validated<VulkanError>>
     {
-        eprintln!("X build_submission");
+        eprintln!("X (first: {}) build_submission", self.first);
         unsafe { self.next.build_submission() }
     }
 
     fn flush(&self) -> Result<(), Validated<VulkanError>> {
-        eprintln!("X flush");
+        eprintln!("X (first: {}) flush", self.first);
         self.next.flush()
     }
 
     unsafe fn signal_finished(&self) {
-        eprintln!("X signal_finished");
+        eprintln!("X (first: {}) signal_finished", self.first);
         unsafe {
             self.next.signal_finished();
         }
     }
 
     fn queue(&self) -> Option<Arc<vulkano::device::Queue>> {
-        eprintln!("X queue");
+        eprintln!("X (first: {}) queue", self.first);
         self.next.queue()
     }
 
     fn queue_change_allowed(&self) -> bool {
-        eprintln!("X queue_change_allowed");
+        eprintln!("X (first: {}) queue_change_allowed", self.first);
         self.next.queue_change_allowed()
     }
 
@@ -226,7 +228,7 @@ unsafe impl<F: GpuFuture> GpuFuture for X<F> {
         exclusive: bool,
         queue: &vulkano::device::Queue,
     ) -> Result<(), vulkano::sync::future::AccessCheckError> {
-        eprintln!("X check_buffer_access");
+        eprintln!("X (first: {}) check_buffer_access", self.first);
         self.next
             .check_buffer_access(buffer, range, exclusive, queue)
     }
@@ -239,7 +241,7 @@ unsafe impl<F: GpuFuture> GpuFuture for X<F> {
         expected_layout: vulkano::image::ImageLayout,
         queue: &vulkano::device::Queue,
     ) -> Result<(), vulkano::sync::future::AccessCheckError> {
-        eprintln!("X check_image_access");
+        eprintln!("X (first: {}) check_image_access", self.first);
         self.next.check_image_access(
             image,
             range,
@@ -255,7 +257,7 @@ unsafe impl<F: GpuFuture> GpuFuture for X<F> {
         image_index: u32,
         before: bool,
     ) -> Result<(), vulkano::sync::future::AccessCheckError> {
-        eprintln!("X check_swapchain_image_acquired");
+        eprintln!("X (first: {}) check_swapchain_image_acquired", self.first);
         self.next
             .check_swapchain_image_acquired(swapchain, image_index, before)
     }
@@ -268,9 +270,10 @@ impl<'a> Run<'a> {
     ) -> Self {
         Self {
             session,
-            future: Box::new(X {
-                next: future.into(),
-            }),
+            future: future.into(), /*Box::new(X {
+                                       next: future.into(),
+                                       first: true,
+                                   }) */
         }
     }
 
@@ -278,7 +281,7 @@ impl<'a> Run<'a> {
         for instr in self.session.instructions.iter() {
             match instr {
                 &Instruction::Invoke(StageId(i)) => {
-                    eprintln!("INVOKING STAGE {}", i);
+                    // eprintln!("INVOKING STAGE {}", i);
                     replace_with_or_abort(&mut self.future, |future| {
                         Box::new(
                             future
@@ -294,9 +297,12 @@ impl<'a> Run<'a> {
                 }
             }
         }
-        replace_with_or_abort(&mut self.future, |future| {
-            Box::new(X { next: future })
-        });
+        // replace_with_or_abort(&mut self.future, |future| {
+        //     Box::new(X {
+        //         next: future,
+        //         first: false,
+        //     })
+        // });
     }
 
     pub fn wait(
@@ -351,7 +357,7 @@ impl From<MakeInputBufferError> for TranslationError {
 #[derive(Debug)]
 pub struct SessionBuilder {
     session: Session,
-    outputs: HashSet<pipeline::OperandBufferId>,
+    outputs: HashSet<l2::OperandBufferId>,
 }
 
 impl SessionBuilder {
@@ -361,39 +367,58 @@ impl SessionBuilder {
             outputs: HashSet::new(),
         }
     }
+}
 
-    fn op_add_elementwise_notinplace(
+impl SessionBuilder {
+    fn op_scaler_notinplace(
         &mut self,
-        ir: &pipeline::IR,
-        lhs: BufferId,
-        rhs: BufferId,
+        ir: &l2::IR,
+        input: BufferId,
         result: BufferId,
         ty: ScalarTy,
         dims_range: (usize, usize),
-    ) -> Result<BufferId, <Self as Translate<pipeline::IR, Session>>::Error>
-    {
-        use crate::kernel::componentwise::{
-            self, Bindings, Config, KernelConfig, Op,
-        };
+        offset: f32,
+        scale: f32,
+    ) -> Result<BufferId, <Self as Translate<l2::IR, Session>>::Error> {
+        use crate::kernel::componentwise::{self, Config, KernelConfig, Op};
         use crate::shader::l0::{Config as ShaderConfig, SPVModuleBuilder};
-        use rspirv::binary::{Assemble, Disassemble};
+        use rspirv::binary::Assemble;
+        let shader_ir = componentwise::Builder::new()
+            .translate(
+                Op::Scaler {
+                    input: 0,
+                    result: 1,
+                    offset,
+                    scale,
+                },
+                &Config {
+                    item_type: ty,
+                    descriptor_set: 0,
+                },
+            )
+            .unwrap();
 
-        let shader_ir = componentwise::new(Config {
-            item_type: ty,
-            descriptor_set: 0,
-            bindings: Bindings {
-                inputs: [0, 1],
-                output: 2,
-            },
-            op: Op::Add,
-        });
+        let shape = ir.get_shape(dims_range);
+        // TODO: Remove the copy-paste bs, it's disgusting. figure out the
+        //       best way to saturate all the subgroups and then workgroups
+        //       asap
+        let (_, greatest_dim_idx) = shape.iter().zip(0..).max().unwrap();
         let rspirv_ir = SPVModuleBuilder::default()
             .translate(
                 shader_ir,
                 &ShaderConfig {
                     local_size: [
-                        ir.get_shape(dims_range).iter().product::<usize>()
-                            as u32,
+                        shape
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &d)| {
+                                if i == greatest_dim_idx {
+                                    None
+                                } else {
+                                    Some(d)
+                                }
+                            })
+                            .product::<usize>() as u32,
                         1,
                         1,
                     ],
@@ -401,7 +426,86 @@ impl SessionBuilder {
                 },
             )
             .unwrap();
-        eprintln!("{}", rspirv_ir.disassemble());
+        let spirv = rspirv_ir.assemble();
+        let shader =
+            unsafe { self.session.ctx.shader_from_spirv(spirv.as_slice()) }
+                .map_err(TranslationError::ShaderFromSpirV)?;
+        let entry_point = shader.entry_point("main").unwrap();
+        let stage = self.session.make_stage(
+            entry_point,
+            &[input],
+            &[result],
+            KernelConfig { offset: 0 },
+            [shape[greatest_dim_idx] as u32, 1, 1],
+        );
+        self.session.instructions.push(Instruction::Invoke(stage));
+        Ok(result)
+    }
+
+    fn op_add_elementwise_notinplace(
+        &mut self,
+        ir: &l2::IR,
+        lhs: BufferId,
+        rhs: BufferId,
+        result: BufferId,
+        ty: ScalarTy,
+        dims_range: (usize, usize),
+    ) -> Result<BufferId, <Self as Translate<l2::IR, Session>>::Error> {
+        use crate::kernel::componentwise::{self, Config, KernelConfig, Op};
+        use crate::shader::l0::{Config as ShaderConfig, SPVModuleBuilder};
+        use rspirv::binary::Assemble;
+
+        let shader_ir = componentwise::Builder::new()
+            .translate(
+                Op::Add {
+                    inputs: [0, 1],
+                    result: 2,
+                },
+                &Config {
+                    item_type: ty,
+                    descriptor_set: 0,
+                },
+            )
+            .unwrap();
+
+        // TODO: Extremely hacky, do something smarter like
+        //  1. calculate linear size
+        //  2. progressively saturate the dims of the subgroup size
+        //  3. progressively saturate the dims of the workgroup size
+        //  4. inform the kernel which dimensions are to be used for indices
+        // but:
+        //  1. need to think about alignment
+        //  2. if I decide to align I should inform the user
+        //  we don't need alignment, only padding. it's elementwise
+        //  also we need to be able to bucket the dimensions into multiple
+        //  invocations if they can't fit into `prod(max_wg)` * `prod(max_sg)`
+        //  todo todo
+        let shape = ir.get_shape(dims_range);
+        let (_, greatest_dim_idx) = shape.iter().zip(0..).max().unwrap();
+        let rspirv_ir = SPVModuleBuilder::default()
+            .translate(
+                shader_ir,
+                &ShaderConfig {
+                    local_size: [
+                        shape
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &d)| {
+                                if i == greatest_dim_idx {
+                                    None
+                                } else {
+                                    Some(d)
+                                }
+                            })
+                            .product::<usize>() as u32,
+                        1,
+                        1,
+                    ],
+                    version: Some((1, 3)),
+                },
+            )
+            .unwrap();
+        // eprintln!("{}", rspirv_ir.disassemble());
         let spirv = rspirv_ir.assemble();
         let shader =
             unsafe { self.session.ctx.shader_from_spirv(spirv.as_slice()) }
@@ -412,22 +516,23 @@ impl SessionBuilder {
             &[lhs, rhs],
             &[result],
             KernelConfig { offset: 0 },
+            [shape[greatest_dim_idx] as u32, 1, 1],
         );
         self.session.instructions.push(Instruction::Invoke(stage));
         Ok(result)
     }
 }
 
-impl Translate<pipeline::IR, Session> for SessionBuilder {
+impl Translate<l2::IR, Session> for SessionBuilder {
     type Error = TranslationError;
     type Config = ();
 
     fn translate(
         mut self,
-        ir: pipeline::IR,
+        ir: l2::IR,
         _config: &Self::Config,
     ) -> Result<Session, Self::Error> {
-        use pipeline::Instr;
+        use l2::Instr;
 
         self.session.input_buffers.reserve(ir.inputs.len());
         self.session.output_buffers.reserve(ir.outputs.len());
@@ -440,7 +545,7 @@ impl Translate<pipeline::IR, Session> for SessionBuilder {
             self.outputs.insert(output);
         }
 
-        for &pipeline::Buffer { ty, dims_range } in ir.operand_buffers.iter() {
+        for &l2::Buffer { ty, dims_range } in ir.operand_buffers.iter() {
             let element_count: usize =
                 ir.dims_pool[dims_range.0..dims_range.1].iter().product();
             let size = element_count * size_of(ty);
@@ -449,37 +554,59 @@ impl Translate<pipeline::IR, Session> for SessionBuilder {
                 .make_storage_buffer(Layout::array::<u8>(size)?, None)?;
         }
 
-        for &pipeline::OperandBufferId(i) in ir.inputs.iter() {
+        for &l2::OperandBufferId(i) in ir.inputs.iter() {
             self.session.input_buffers.push(BufferId(i));
         }
 
         for instr in ir.instructions.iter() {
             match instr {
-                &Instr::Op(pipeline::OpId(i)) => {
+                &Instr::Op(l2::OpId(i)) => {
                     // TODO: Put this in a function or smth
                     let outputs = match &ir.operations[i] {
-                        &pipeline::Op::Binary(pipeline::BinOp {
-                            kind: pipeline::BinOpKind::AddElementwise,
+                        &l2::Op::Binary(l2::BinOp {
+                            kind: l2::BinOpKind::AddElementwise,
                             operands:
-                                pipeline::BinOperands::NotInplace {
-                                    lhs: pipeline::BufferId::Operand(lhs),
-                                    rhs: pipeline::BufferId::Operand(rhs),
+                                l2::BinOperands::NotInplace {
+                                    lhs: l2::BufferId::Operand(lhs),
+                                    rhs: l2::BufferId::Operand(rhs),
                                     result,
                                 },
                         }) => {
-                            let pipeline::OperandBufferId(lhs_i) = lhs;
-                            let pipeline::OperandBufferId(rhs_i) = rhs;
-                            let pipeline::OperandBufferId(result_i) = result;
+                            let l2::OperandBufferId(lhs_i) = lhs;
+                            let l2::OperandBufferId(rhs_i) = rhs;
+                            let l2::OperandBufferId(result_i) = result;
                             let lhs_id = BufferId(lhs_i);
                             let rhs_id = BufferId(rhs_i);
                             let result_id = BufferId(result_i);
-                            let &pipeline::Buffer { ty, dims_range } =
+                            let &l2::Buffer { ty, dims_range } =
                                 ir.get_operand(lhs);
                             let output = self.op_add_elementwise_notinplace(
                                 &ir, lhs_id, rhs_id, result_id, ty, dims_range,
                             )?;
                             [(result, output)].into_iter()
                         }
+
+                        &l2::Op::Unary(l2::UnOp {
+                            kind: l2::UnOpKind::Scaler { offset, scale },
+                            operand:
+                                l2::UnOperand::NotInplace {
+                                    result,
+                                    operand: l2::BufferId::Operand(operand),
+                                },
+                        }) => {
+                            let l2::OperandBufferId(input_i) = operand;
+                            let l2::OperandBufferId(result_i) = result;
+                            let input_id = BufferId(input_i);
+                            let result_id = BufferId(result_i);
+                            let &l2::Buffer { ty, dims_range } =
+                                ir.get_operand(operand);
+                            let output = self.op_scaler_notinplace(
+                                &ir, input_id, result_id, ty, dims_range,
+                                offset, scale,
+                            )?;
+                            [(result, output)].into_iter()
+                        }
+
                         op => todo!("unimplemented operation: {:#?}", op),
                     };
                     for (output, buffer_id) in outputs {
@@ -506,6 +633,7 @@ mod tests {
     use vulkano::buffer::Subbuffer;
 
     use crate::context::Config;
+    use crate::l_base::test_utils::project_path;
     use crate::protos::onnx::ModelProto;
     use crate::{l0, l1};
 
@@ -521,28 +649,25 @@ mod tests {
             .unwrap(),
         );
 
-        let model_path = l0::test_utils::project_path()
+        let model_path = project_path()
             .join("test_models")
-            .join("simple_add.onnx");
+            .join("simple_scaler.onnx");
         let bytes = std::fs::read(model_path).unwrap();
-        let model = ModelProto::parse_from_bytes(bytes.as_slice()).unwrap();
 
-        let mut session = SessionBuilder::new(ctx)
-            .translate(
-                pipeline::IRBuilder::default()
-                    .translate(
-                        l1::IRBuilder::default().translate(
-                            l0::IRBuilder::default()
-                                .translate(model, &())
-                                .unwrap(),
-                            &(),
-                        ).unwrap(),
-                        &(),
-                    )
-                    .unwrap(),
-                &(),
-            )
-            .unwrap();
+        let model = ModelProto::parse_from_bytes(bytes.as_slice()).unwrap();
+        eprintln!("model: {:?}\n", model);
+
+        let l0 = l0::IRBuilder::default().translate(model, &()).unwrap();
+        eprintln!("l0: {:?}\n", l0);
+
+        let l1 = l1::IRBuilder::default().translate(l0, &()).unwrap();
+        eprintln!("l1: {:?}\n", l1);
+
+        let pipeline = l2::IRBuilder::default().translate(l1, &()).unwrap();
+        eprintln!("pipeline: {:?}\n", pipeline);
+
+        let mut session =
+            SessionBuilder::new(ctx).translate(pipeline, &()).unwrap();
 
         eprintln!("INPUTS: {:?}", session.input_buffers);
         eprintln!("OUTPUTS: {:?}", session.output_buffers);
@@ -551,27 +676,30 @@ mod tests {
             session.get_buffer(session.input_buffers[0]).clone(),
         )
         .reinterpret::<[f32]>();
-        let b = Into::<Subbuffer<_>>::into(
-            session.get_buffer(session.input_buffers[1]).clone(),
-        )
-        .reinterpret::<[f32]>();
+        // let b = Into::<Subbuffer<_>>::into(
+        //     session.get_buffer(session.input_buffers[1]).clone(),
+        // )
+        // .reinterpret::<[f32]>();
+        // let c = Into::<Subbuffer<_>>::into(
+        //     session.get_buffer(session.input_buffers[2]).clone(),
+        // )
+        // .reinterpret::<[f32]>();
 
         {
             let mut a_access = a.write().unwrap();
-            let mut b_access = b.write().unwrap();
+            // let mut b_access = b.write().unwrap();
+            // let mut c_access = c.write().unwrap();
             for i in 0..a_access.len() {
                 a_access[i] = (i + 1) as f32;
-                b_access[i] = (a_access.len() - i) as f32;
+                // b_access[i] = (a_access.len() - i) as f32;
+                // c_access[i] = -(i as f32) / 2.0;
             }
-            eprintln!("{:?} {:?}", &a_access[..], &b_access[..]);
+            // eprintln!("{:?} {:?}", &a_access[..], &b_access[..]);
         }
 
         let mut run = session.make_run();
         run.run();
         let () = run.wait(None).unwrap();
-
-        eprintln!("INPUTS: {:?}", session.input_buffers);
-        eprintln!("OUTPUTS: {:?}", session.output_buffers);
 
         for (i, buffer) in session.buffers.iter().enumerate() {
             let subbuffer = Into::<Subbuffer<_>>::into(buffer.clone())

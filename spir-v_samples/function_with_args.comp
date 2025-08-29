@@ -7,29 +7,29 @@ layout (push_constant) uniform config {
 } Config;
 
 layout (set = 0, binding = 0) readonly buffer InputBufferA {
-  int values[];
+  float values[];
 } inputA;
 
 layout (set = 0, binding = 1) readonly buffer InputBufferB {
-  int values[];
+  float values[];
 } inputB;
 
 layout (set = 0, binding = 2) buffer OutputBufferC {
-  int values[];
+  float values[];
 } outputC;
 
-int add(const int, const int);
+float add(const float, const float);
 
 void main() {
   uint gID = gl_GlobalInvocationID.x;
   uint offset = Config.offset;
   uint idx = gID + offset;
-  int a = inputA.values[idx];
-  int b = inputB.values[idx];
-  int c = add(a, b);
+  float a = inputA.values[idx];
+  float b = inputB.values[idx];
+  float c = add(a, b) + 2.5f;
   outputC.values[idx] = c;
 }
 
-int add(const int a, const int b) {
+float add(const float a, const float b) {
   return a + b;
 }

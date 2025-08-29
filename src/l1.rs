@@ -12,7 +12,7 @@ pub struct IR {
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Instruction {
     pub op: Operation,
     pub result: Argument,
@@ -25,22 +25,17 @@ pub struct Argument {
     // pub batch_dim: Option<BatchDimension>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
-    BinOp(BinOp<Value>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BinOp<T: PartialEq + Eq + Clone> {
-    pub kind: BinOpKind,
-    pub lhs: T,
-    pub rhs: T,
-    // pub broadcast: BroadcastConfig,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOpKind {
-    Add,
+    Add {
+        lhs: Value,
+        rhs: Value,
+    },
+    Scaler {
+        input: Value,
+        offset: f32,
+        scale: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,18 +59,12 @@ pub enum Error {
     ShapeMismatch(usize),
 }
 
-enum InstructionError {
-    TyMismatch,
-    InvalidValue(Value),
-    ShapeMismatch,
-}
-
 type Result<V> = CoreResult<V, Error>;
 
 impl IRBuilder {
     fn build_inputs(&mut self, l0: &l0::IR) -> Result<()> {
         for (i, input) in l0.inputs.iter().enumerate() {
-            let (shape, _batch_dim) = parse_shape(input.shape.as_slice())
+            let (shape, _batch_dim) = parse_shape(&input.shape)
                 // NOTE: Maybe put this into a function
                 .map_err(|e| match e {
                     ShapeParseError::Shapeless => Error::MissingInputShape(i),
@@ -93,24 +82,73 @@ impl IRBuilder {
     }
 
     fn build_instructions(&mut self, l0: &l0::IR) -> Result<()> {
-        let operations = &l0.operations;
-        for (i, op) in operations.iter().enumerate() {
-            match op {
-                &l0::Operation::BinOp(l0::BinOp { kind, lhs, rhs }) => {
-                    let instr = self.make_binop(kind, lhs, rhs).map_err(
-                        |e| match e {
-                            InstructionError::TyMismatch => {
-                                Error::OperandTyMismatch(i)
-                            }
-                            InstructionError::InvalidValue(v) => {
-                                Error::InvalidValue(i, v)
-                            }
-                            InstructionError::ShapeMismatch => {
-                                Error::ShapeMismatch(i)
-                            }
-                        },
-                    )?;
-                    self.instructions.push(instr);
+        let layers = &l0.layers;
+        for (i, layer) in layers.iter().enumerate() {
+            let &l0::Layer {
+                kind,
+                inputs_range,
+                attributes_range,
+            } = layer;
+            let inputs = l0.get_layer_inputs(inputs_range);
+            match kind {
+                l0::LayerKind::Add => {
+                    let &[lhs, rhs] = inputs else { unreachable!() };
+                    let lhs_data = self
+                        .get_argument(lhs)
+                        .ok_or(Error::InvalidValue(i, lhs))?;
+                    let rhs_data = self
+                        .get_argument(rhs)
+                        .ok_or(Error::InvalidValue(i, rhs))?;
+                    let ty = matching_ty(lhs_data.ty, rhs_data.ty)
+                        .ok_or(Error::OperandTyMismatch(i))?;
+                    let shape /* , batch_dim */ =
+                        match_shape(&lhs_data, &rhs_data)
+                            .map_err(|()| Error::ShapeMismatch(i))?;
+                    let result = Argument {
+                        ty,
+                        shape,
+                        // batch_dim,
+                    };
+                    let op = Operation::Add { lhs, rhs };
+                    self.instructions.push(Instruction { op, result });
+                }
+
+                l0::LayerKind::Scaler => {
+                    let &[input] = inputs else { unreachable!() };
+                    let input_data = self
+                        .get_argument(input)
+                        .ok_or(Error::InvalidValue(i, input))?;
+                    // TODO: Validate input type
+                    let attributes =
+                        l0.get_layer_attributes(attributes_range.unwrap());
+                    let l0::Attribute {
+                        data: l0::AttributeData::Floats(offsets),
+                        ..
+                    } = attributes
+                        .iter()
+                        .find(|attr| attr.name == "offset")
+                        .unwrap()/* else { panic!("Wrong attribute kind") }*/;
+                    let l0::Attribute {
+                        data: l0::AttributeData::Floats(scales),
+                        ..
+                    } = attributes
+                        .iter()
+                        .find(|attr| attr.name == "scale")
+                        .unwrap();
+                    assert_eq!(offsets.len(), 1);
+                    assert_eq!(scales.len(), 1);
+                    let offset = offsets[0];
+                    let scale = scales[0];
+                    let op = Operation::Scaler {
+                        input,
+                        offset,
+                        scale,
+                    };
+                    let result = Argument {
+                        ty: input_data.ty,
+                        shape: input_data.shape.clone(),
+                    };
+                    self.instructions.push(Instruction { op, result });
                 }
             }
         }
@@ -125,66 +163,22 @@ impl IRBuilder {
             }
         }
     }
-
-    fn make_binop(
-        &self,
-        kind: l0::BinOpKind,
-        lhs: Value,
-        rhs: Value,
-    ) -> CoreResult<Instruction, InstructionError> {
-        use InstructionError::*;
-        let lhs_data = self.get_argument(lhs).ok_or(InvalidValue(lhs))?;
-        let rhs_data = self.get_argument(rhs).ok_or(InvalidValue(rhs))?;
-        let (op, result) = match kind {
-            l0::BinOpKind::Add => {
-                let result = self.make_add(lhs_data, rhs_data)?;
-                let op = Operation::BinOp(BinOp {
-                    kind: BinOpKind::Add,
-                    lhs,
-                    rhs,
-                });
-                (op, result)
-            }
-        };
-
-        Ok(Instruction { op, result })
-    }
-
-    fn make_add(
-        &self,
-        lhs: &Argument,
-        rhs: &Argument,
-    ) -> CoreResult<Argument, InstructionError> {
-        let ty = match_ty(lhs.ty, rhs.ty)?;
-        let shape /* , batch_dim */ = match_shape(&lhs, &rhs)?;
-
-        Ok(Argument {
-            ty,
-            shape,
-            // batch_dim,
-        })
-    }
 }
 
-fn match_ty(
-    lhs: ScalarTy,
-    rhs: ScalarTy,
-) -> CoreResult<ScalarTy, InstructionError> {
-    if lhs == rhs {
-        Ok(lhs)
-    } else {
-        Err(InstructionError::TyMismatch)
-    }
+fn matching_ty(lhs: ScalarTy, rhs: ScalarTy) -> Option<ScalarTy> {
+    if lhs == rhs { Some(lhs) } else { None }
 }
 
 fn match_shape(
     lhs: &Argument,
     rhs: &Argument,
-) -> CoreResult<Box<[usize]>/* , Option<BatchDimension> */, InstructionError> {
-    if lhs.shape == rhs.shape /* && lhs.batch_dim == rhs.batch_dim */ {
+) -> CoreResult<Box<[usize]> /* , Option<BatchDimension> */, ()> {
+    if lhs.shape == rhs.shape
+    /* && lhs.batch_dim == rhs.batch_dim */
+    {
         Ok(lhs.shape.clone() /* , lhs.batch_dim */)
     } else {
-        Err(InstructionError::ShapeMismatch)
+        Err(())
     }
 }
 
@@ -227,7 +221,7 @@ impl Translate<l0::IR, IR> for IRBuilder {
 
     fn translate(mut self, l0: l0::IR, _config: &Self::Config) -> Result<IR> {
         self.inputs.reserve(l0.inputs.len());
-        self.instructions.reserve(l0.operations.len());
+        self.instructions.reserve(l0.layers.len());
         self.build_inputs(&l0)?;
         self.build_instructions(&l0)?;
 
@@ -273,27 +267,33 @@ mod tests {
 
     #[test]
     fn test_simple_add_parse() {
+        let shape = Box::new([None, Some(2)]);
         let ir = l0::IR {
             input_names: ["X", "Y"].iter().map(<&str>::to_string).collect(),
             output_names: ["Z"].iter().map(<&str>::to_string).collect(),
             inputs: vec![
                 l0::Input {
-                    shape: vec![None, Some(2)],
+                    shape: shape.clone(),
                     ty: ScalarTy::F32,
                 },
                 l0::Input {
-                    shape: vec![None, Some(2)],
+                    shape: shape,
                     ty: ScalarTy::F32,
                 },
             ],
             outputs: vec![l0::Output {
                 value: Value::Parameter(0.into()),
             }],
-            operations: vec![l0::Operation::BinOp(l0::BinOp {
-                kind: l0::BinOpKind::Add,
-                lhs: Value::Parameter(0.into()),
-                rhs: Value::Parameter(1.into()),
-            })],
+            layers: vec![l0::Layer {
+                kind: l0::LayerKind::Add,
+                inputs_range: (0, 2),
+                attributes_range: None,
+            }],
+            layer_inputs: vec![
+                Value::Parameter(0.into()),
+                Value::Parameter(1.into()),
+            ],
+            layer_attributes: vec![],
         };
 
         let ir = IRBuilder::default().translate(ir, &()).unwrap();

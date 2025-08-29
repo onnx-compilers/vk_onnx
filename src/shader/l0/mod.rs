@@ -78,6 +78,8 @@ pub enum ValueNodeOp {
     Load(Value),
     IAdd(Value, Value),
     FAdd(Value, Value),
+    IMul(Value, Value),
+    FMul(Value, Value),
     // TODO: Check for access chain validity
     Access(Value, Box<[Value]>),
 }
@@ -293,6 +295,10 @@ impl Translate<IR, SPVModule> for SPVModuleBuilder {
                     let t = type_mapper.scalars.get_u32(&mut b);
                     b.constant_bit32(t, v)
                 }
+                &Constant::Scalar(ScalarConstant::F32(v)) => {
+                    let t = type_mapper.scalars.get_f32(&mut b);
+                    b.constant_bit32(t, v.to_bits())
+                }
                 _ => todo!(),
             };
             constant_ids.push(id);
@@ -476,7 +482,7 @@ impl IR {
         Default::default()
     }
 
-    fn types(&self) -> Types {
+    fn types<'a>(&'a self) -> Types<'a> {
         Types {
             composite: &self.composite_types,
             ptr: &self.ptr_types,
@@ -621,6 +627,10 @@ impl ValueNode {
 
     pub fn fadd(ty: Ty, a: Value, b: Value) -> Self {
         Self::new(ty, ValueNodeOp::FAdd(a, b))
+    }
+
+    pub fn fmul(ty: Ty, a: Value, b: Value) -> Self {
+        Self::new(ty, ValueNodeOp::FMul(a, b))
     }
 
     pub fn load(ty: Ty, a: Value) -> Self {
@@ -837,6 +847,37 @@ impl<'a> FunctionCompiler<'a> {
                     return Err(Error::WrongNumberType(inner_ty));
                 }
                 let op_id = b.f_add(ty_id, None, lhs, rhs)?;
+                self.value_ids.push(op_id);
+            }
+
+            ValueNode {
+                // ty,
+                op: Op::IMul(_lhs, _rhs),
+                ..
+            } => todo!(),
+
+            ValueNode {
+                ty,
+                op: Op::FMul(lhs, rhs)
+            } => {
+                let lhs = self.get_value(*lhs);
+                let rhs = self.get_value(*rhs);
+                // TODO: Check type compatibility for operation
+                let ty_id = self.type_mapper.get(
+                    b,
+                    self.ir_types,
+                    self.constant_ids,
+                    ty,
+                );
+                let inner_ty = match ty {
+                    &Ty::Scalar(ty) => ty,
+                    &Ty::Vec(ty, _n) => ty,
+                    _ => todo!(),
+                };
+                if !matches!(inner_ty, ScalarTy::F32) {
+                    return Err(Error::WrongNumberType(inner_ty));
+                }
+                let op_id = b.f_mul(ty_id, None, lhs, rhs)?;
                 self.value_ids.push(op_id);
             }
 

@@ -1,11 +1,13 @@
 import onnx
 from onnx import helper, AttributeProto, TensorProto, GraphProto
 
-A = helper.make_tensor_value_info("A", TensorProto.FLOAT, [1])
-B = helper.make_tensor_value_info("B", TensorProto.FLOAT, [1])
-C = helper.make_tensor_value_info("C", TensorProto.FLOAT, [1])
-A_plus_B = helper.make_tensor_value_info("A+B", TensorProto.FLOAT, [1])
-D = helper.make_tensor_value_info("(A+B)+C", TensorProto.FLOAT, [1])
+shape = [2, 2, 10]
+
+A = helper.make_tensor_value_info("A", TensorProto.FLOAT, shape)
+B = helper.make_tensor_value_info("B", TensorProto.FLOAT, shape)
+C = helper.make_tensor_value_info("C", TensorProto.FLOAT, shape)
+A_plus_B = helper.make_tensor_value_info("A+B", TensorProto.FLOAT, shape)
+D = helper.make_tensor_value_info("(A+B)+C", TensorProto.FLOAT, shape)
 
 node_def = [
     helper.make_node("Add", ["A", "B"], ["A+B"]),

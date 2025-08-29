@@ -14,3 +14,17 @@ pub enum ScalarTy {
     S32,
     U32,
 }
+
+#[cfg(test)]
+pub mod test_utils {
+    use std::path::Path;
+
+    pub fn project_path() -> Box<Path> {
+        Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .into()
+    }
+}

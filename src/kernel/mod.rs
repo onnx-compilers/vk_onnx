@@ -75,11 +75,12 @@ pub mod componentwise {
     //!   (store (@ output values idx) c))
     //! ```
     use crate::{
-        l_base::ScalarTy,
+        l_base::{ScalarTy, Translate},
         shader::l0::{
-            CompositeTy, Constant, Function, Node, PushConstant,
-            ScalarConstant, StorageBuffer, StructMember, Ty, ValueNode,
-            Variable,
+            BuiltinId, CompositeTy, /* , CompositeTyId */
+            Constant, ConstantId, Function, Node, PtrTyId, PushConstant,
+            PushConstantId, ScalarConstant, StorageBuffer, StructMember,
+            Temporary, Ty, ValueNode, Variable,
         },
     };
     use rspirv::spirv::{BuiltIn, StorageClass};
@@ -95,16 +96,20 @@ pub mod componentwise {
     // }
 
     #[derive(Debug, Clone)]
-    pub enum Op {
-        Add,
+    pub enum Op<B> {
+        // Maybe we need the unop, binop, multiop distinction
+        Add {
+            inputs: [B; 2],
+            result: B,
+        },
+        Scaler {
+            input: B,
+            result: B,
+            offset: f32,
+            scale: f32,
+        },
         // Sub,
         // Mul
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct Bindings {
-        pub inputs: [u32; 2],
-        pub output: u32,
     }
 
     #[derive(Debug, Clone, BufferContents)]
@@ -117,8 +122,6 @@ pub mod componentwise {
     pub struct Config {
         pub item_type: ScalarTy,
         pub descriptor_set: u32,
-        pub bindings: Bindings,
-        pub op: Op,
     }
 
     impl Default for Config {
@@ -126,168 +129,358 @@ pub mod componentwise {
             Self {
                 item_type: ScalarTy::F32,
                 descriptor_set: 0,
-                bindings: Bindings {
-                    inputs: [0, 1],
-                    output: 2,
-                },
-                op: Op::Add,
             }
         }
     }
 
-    pub fn new(config: Config) -> IR {
-        let Config {
-            item_type: scalar_t_item,
-            descriptor_set,
-            bindings:
-                Bindings {
-                    inputs: input_bindings,
-                    output: output_binding,
-                },
-            op,
-        } = config;
-        let mut ir = IR::new();
+    #[derive(Debug, Clone)]
+    pub struct Builder {
+        ir: IR,
+        // TODO: Maybe persist this sort of state in such a way that multiple
+        //       kernel builders can use it so that they can be merged into one
+        //       shader.
+        fn_main: Function,
+        // t_u32: Ty,
+        // t_u32_ptr: PtrTyId,
+        // t_u32_vec3: Ty,
+        // t_u32_vec3_ptr: PtrTyId,
+        // t_config_struct: CompositeTyId,
+        // t_config_ptr: PtrTyId,
+        const_u32_0: ConstantId,
+        bi_global_invocation_id: BuiltinId,
+        pc_config: PushConstantId,
+        // tmp_gii_x_ptr: Temporary,
+        // tmp_gii_x: Temporary,
+        // tmp_offset_ptr: Temporary,
+        // tmp_offset: Temporary,
+        tmp_idx: Temporary,
+    }
 
-        let t_item = scalar_t_item.into();
-        let t_u32 = ScalarTy::U32.into();
-        let t_u32_ptr = ir.make_ptr_type(t_u32);
-        let t_u32_vec3 = Ty::Vec(ScalarTy::U32, 3);
-        let t_u32_vec3_ptr = ir.make_ptr_type(t_u32_vec3);
-        let t_item_ptr = ir.make_ptr_type(t_item);
+    struct IOState {
+        t_item_scalar: ScalarTy,
+        t_item: Ty,
+        t_item_ptr: PtrTyId,
+        // t_item_rt_array: CompositeTyId,
+        // t_input_struct: CompositeTyId,
+        // t_output_struct: CompositeTyId,
+        t_input_ptr: PtrTyId,
+        t_output_ptr: PtrTyId,
+    }
 
-        let t_item_rt_array = ir
-            .make_composite_type(CompositeTy::Array1(t_item, None))
-            .into();
-        let t_input_struct = ir
-            .make_composite_type(CompositeTy::r#struct(
-                [StructMember {
-                    ty: t_item_rt_array,
-                    writable: false,
-                }],
-                true,
-            ))
-            .into();
-        let t_output_struct = ir
-            .make_composite_type(CompositeTy::r#struct(
-                [StructMember {
-                    ty: t_item_rt_array,
-                    writable: true,
-                }],
-                true,
-            ))
-            .into();
-        let t_config_struct = ir
-            .make_composite_type(CompositeTy::r#struct(
-                [StructMember {
-                    ty: t_u32,
-                    writable: false,
-                }],
-                true,
-            ))
-            .into();
-        let t_input_ptr = ir.make_ptr_type(t_input_struct);
-        let t_output_ptr = ir.make_ptr_type(t_output_struct);
-        let t_config_ptr = ir.make_ptr_type(t_config_struct);
+    impl Builder {
+        pub fn new() -> Self {
+            let mut ir = IR::new();
 
-        let const_u32_0 = ir
-            .make_constant(Constant::Scalar(ScalarConstant::U32(0)))
-            .into();
+            let t_u32 = ScalarTy::U32.into();
+            let t_u32_ptr = ir.make_ptr_type(t_u32);
+            let t_u32_vec3 = Ty::Vec(ScalarTy::U32, 3);
+            let t_u32_vec3_ptr = ir.make_ptr_type(t_u32_vec3);
+            let t_config_struct =
+                ir.make_composite_type(CompositeTy::r#struct(
+                    [StructMember {
+                        ty: t_u32,
+                        writable: false,
+                    }],
+                    true,
+                ));
+            let t_config_ptr = ir.make_ptr_type(t_config_struct.into());
 
-        let global_invocation_id =
-            ir.make_builtin(t_u32_vec3_ptr, BuiltIn::GlobalInvocationId);
+            let const_u32_0 =
+                ir.make_constant(Constant::Scalar(ScalarConstant::U32(0)));
 
-        let inputs = input_bindings.map(|binding| -> Variable {
-            ir.make_storage_buffer(StorageBuffer {
-                ty: t_input_ptr,
-                descriptor_set,
-                binding,
-                writable: false,
-            })
-            .into()
-        });
-        let output: Variable = ir
-            .make_storage_buffer(StorageBuffer {
-                ty: t_output_ptr,
-                descriptor_set,
-                binding: output_binding,
-                writable: true,
-            })
-            .into();
-        let config: Variable = ir
-            .make_push_constant(PushConstant { ty: t_config_ptr })
-            .into();
+            let global_invocation_id =
+                ir.make_builtin(t_u32_vec3_ptr, BuiltIn::GlobalInvocationId);
+            let config = ir.make_push_constant(PushConstant {
+                ty: t_config_ptr.into(),
+            });
 
-        let mut main = Function::new(Some("main".into()), None);
+            let mut main = Function::new(Some("main".into()), None);
 
-        let gii_x_ptr = main
-            .append_value_node(ValueNode::access(
+            let gii_x_ptr = main.append_value_node(ValueNode::access(
                 t_u32_ptr,
                 StorageClass::Input,
                 global_invocation_id.into(),
-                [const_u32_0],
-            ))
-            .into();
-        let gii_x = main
-            .append_value_node(ValueNode::load(t_u32, gii_x_ptr))
-            .into();
+                [const_u32_0.into()],
+            ));
+            let gii_x = main
+                .append_value_node(ValueNode::load(t_u32, gii_x_ptr.into()));
 
-        let offset_ptr = main
-            .append_value_node(ValueNode::access(
+            let offset_ptr = main.append_value_node(ValueNode::access(
                 t_u32_ptr,
                 StorageClass::Uniform,
                 config.into(),
-                [const_u32_0],
-            ))
-            .into();
-        let offset = main
-            .append_value_node(ValueNode::load(t_u32, offset_ptr))
-            .into();
-        let idx = main
-            .append_value_node(ValueNode::iadd(t_u32, gii_x, offset))
-            .into();
+                [const_u32_0.into()],
+            ));
+            let offset = main
+                .append_value_node(ValueNode::load(t_u32, offset_ptr.into()));
+            let idx = main.append_value_node(ValueNode::iadd(
+                t_u32,
+                gii_x.into(),
+                offset.into(),
+            ));
 
-        let [a, b] = inputs.map(|input| {
-            let ptr_id = main
+            Self {
+                ir,
+                fn_main: main,
+                // t_u32,
+                // t_u32_ptr,
+                // t_u32_vec3,
+                // t_u32_vec3_ptr,
+                // t_config_struct,
+                // t_config_ptr,
+                const_u32_0,
+                bi_global_invocation_id: global_invocation_id,
+                pc_config: config,
+                // tmp_gii_x: gii_x,
+                // tmp_gii_x_ptr: gii_x_ptr,
+                // tmp_offset_ptr: offset_ptr,
+                // tmp_offset: offset,
+                tmp_idx: idx,
+            }
+        }
+
+        fn build_add(
+            &mut self,
+            io_state: &IOState,
+            interface: &mut Vec<Variable>,
+            descriptor_set: u32,
+            input_bindings: [u32; 2],
+            result_binding: u32,
+        ) {
+            let inputs = input_bindings.map(|binding| -> Variable {
+                self.ir
+                    .make_storage_buffer(StorageBuffer {
+                        ty: io_state.t_input_ptr,
+                        descriptor_set,
+                        binding,
+                        writable: false,
+                    })
+                    .into()
+            });
+            let output: Variable = self
+                .ir
+                .make_storage_buffer(StorageBuffer {
+                    ty: io_state.t_output_ptr,
+                    descriptor_set,
+                    binding: result_binding,
+                    writable: true,
+                })
+                .into();
+
+            let [a, b] = inputs.map(|input| {
+                let ptr_id = self
+                    .fn_main
+                    .append_value_node(ValueNode::access(
+                        io_state.t_item_ptr,
+                        StorageClass::StorageBuffer,
+                        input.into(),
+                        [self.const_u32_0.into(), self.tmp_idx.into()],
+                    ))
+                    .into();
+                self.fn_main
+                    .append_value_node(ValueNode::load(
+                        io_state.t_item.into(),
+                        ptr_id,
+                    ))
+                    .into()
+            });
+
+            let c = match io_state.t_item_scalar {
+                ScalarTy::F32 => self
+                    .fn_main
+                    .append_value_node(ValueNode::fadd(io_state.t_item, a, b)),
+                ScalarTy::U32 | ScalarTy::S32 => self
+                    .fn_main
+                    .append_value_node(ValueNode::iadd(io_state.t_item, a, b)),
+            };
+            let c_ptr = self.fn_main.append_value_node(ValueNode::access(
+                io_state.t_item_ptr,
+                StorageClass::StorageBuffer,
+                output.into(),
+                [self.const_u32_0.into(), self.tmp_idx.into()],
+            ));
+
+            self.fn_main
+                .append_node(Node::Store(c_ptr.into(), c.into()));
+            self.fn_main.append_node(Node::Return);
+
+            interface.extend_from_slice(&inputs[..]);
+            interface.push(output);
+        }
+
+        fn build_scaler(
+            &mut self,
+            io_state: &IOState,
+            interface: &mut Vec<Variable>,
+            descriptor_set: u32,
+            input_binding: u32,
+            result_binding: u32,
+            offset: f32,
+            scale: f32,
+        ) {
+            let const_offset = self
+                .ir
+                .make_constant(Constant::Scalar(ScalarConstant::F32(offset)))
+                .into();
+            let const_scale = self
+                .ir
+                .make_constant(Constant::Scalar(ScalarConstant::F32(scale)))
+                .into();
+
+            let sb_input: Variable = self
+                .ir
+                .make_storage_buffer(StorageBuffer {
+                    ty: io_state.t_input_ptr,
+                    descriptor_set,
+                    binding: input_binding,
+                    writable: false,
+                })
+                .into();
+
+            let sb_output: Variable = self
+                .ir
+                .make_storage_buffer(StorageBuffer {
+                    ty: io_state.t_output_ptr,
+                    descriptor_set,
+                    binding: result_binding,
+                    writable: true,
+                })
+                .into();
+
+            let tmp_x_ptr = self
+                .fn_main
                 .append_value_node(ValueNode::access(
-                    t_item_ptr,
+                    io_state.t_item_ptr,
                     StorageClass::StorageBuffer,
-                    input.into(),
-                    [const_u32_0, idx],
+                    sb_input.into(),
+                    [self.const_u32_0.into(), self.tmp_idx.into()],
                 ))
                 .into();
-            main.append_value_node(ValueNode::load(t_item, ptr_id))
-                .into()
-        });
+            let tmp_x = self
+                .fn_main
+                .append_value_node(ValueNode::load(
+                    io_state.t_item.into(),
+                    tmp_x_ptr,
+                ))
+                .into();
 
-        let c = match (scalar_t_item, op) {
-            (ScalarTy::F32, Op::Add) => {
-                main.append_value_node(ValueNode::fadd(t_item, a, b))
+            if !matches!(io_state.t_item_scalar, ScalarTy::F32) {
+                todo!("type for Scaler layer: {:?}", io_state.t_item_scalar);
             }
-            (ScalarTy::U32 | ScalarTy::S32, Op::Add) => {
-                main.append_value_node(ValueNode::iadd(t_item, a, b))
+
+            let tmp_y1 = self
+                .fn_main
+                .append_value_node(ValueNode::fadd(
+                    io_state.t_item,
+                    tmp_x,
+                    const_offset,
+                ))
+                .into();
+            let tmp_y = self
+                .fn_main
+                .append_value_node(ValueNode::fmul(
+                    io_state.t_item,
+                    tmp_y1,
+                    const_scale,
+                ))
+                .into();
+
+            let tmp_y_ptr = self
+                .fn_main
+                .append_value_node(ValueNode::access(
+                    io_state.t_item_ptr,
+                    StorageClass::StorageBuffer,
+                    sb_output.into(),
+                    [self.const_u32_0.into(), self.tmp_idx.into()],
+                ))
+                .into();
+            self.fn_main.append_node(Node::Store(tmp_y_ptr, tmp_y));
+            self.fn_main.append_node(Node::Return);
+
+            interface.extend_from_slice(&[sb_input, sb_output]);
+        }
+    }
+
+    impl Translate<Op<u32>, IR> for Builder {
+        type Error = ();
+        type Config = Config;
+
+        fn translate(
+            mut self,
+            op: Op<u32>,
+            config: &Self::Config,
+        ) -> Result<IR, Self::Error> {
+            let &Config {
+                item_type: t_item_scalar,
+                descriptor_set,
+            } = config;
+            let t_item = t_item_scalar.into();
+            let t_item_ptr = self.ir.make_ptr_type(t_item);
+            let t_item_rt_array = self
+                .ir
+                .make_composite_type(CompositeTy::Array1(t_item, None));
+            let t_input_struct =
+                self.ir.make_composite_type(CompositeTy::r#struct(
+                    [StructMember {
+                        ty: t_item_rt_array.into(),
+                        writable: false,
+                    }],
+                    true,
+                ));
+            let t_output_struct =
+                self.ir.make_composite_type(CompositeTy::r#struct(
+                    [StructMember {
+                        ty: t_item_rt_array.into(),
+                        writable: true,
+                    }],
+                    true,
+                ));
+            let t_input_ptr = self.ir.make_ptr_type(t_input_struct.into());
+            let t_output_ptr = self.ir.make_ptr_type(t_output_struct.into());
+            let io_state = IOState {
+                t_item_scalar,
+                t_item,
+                t_item_ptr,
+                // t_item_rt_array,
+                // t_input_struct,
+                // t_output_struct,
+                t_input_ptr,
+                t_output_ptr,
+            };
+
+            let mut interface = vec![
+                self.bi_global_invocation_id.into(),
+                self.pc_config.into(),
+            ];
+
+            match op {
+                Op::Add { inputs, result } => self.build_add(
+                    &io_state,
+                    &mut interface,
+                    descriptor_set,
+                    inputs,
+                    result,
+                ),
+                Op::Scaler {
+                    input,
+                    result,
+                    offset,
+                    scale,
+                } => self.build_scaler(
+                    &io_state,
+                    &mut interface,
+                    descriptor_set,
+                    input,
+                    result,
+                    offset,
+                    scale,
+                ),
             }
-        };
-        let c_ptr = main.append_value_node(ValueNode::access(
-            t_item_ptr,
-            StorageClass::StorageBuffer,
-            output.into(),
-            [const_u32_0, idx],
-        ));
 
-        main.append_node(Node::Store(c_ptr.into(), c.into()));
-        main.append_node(Node::Return);
-        let main_id = ir.make_function(main);
-        ir.entry_point(
-            main_id,
-            [
-                global_invocation_id.into(),
-                inputs[0],
-                inputs[1],
-                output,
-                config,
-            ],
-        );
+            let main_id = self.ir.make_function(self.fn_main);
+            self.ir.entry_point(main_id, interface.into_boxed_slice());
 
-        ir
+            Ok(self.ir)
+        }
     }
 }
