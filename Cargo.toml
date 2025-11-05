@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bitset-core = "0.1.1"
+cranelift-entity = "0.125.3"
 protobuf = "3.7.2"
 replace_with = "0.1.8"
 rspirv = "0.12.0"

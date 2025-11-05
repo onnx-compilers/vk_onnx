@@ -30,6 +30,7 @@ struct Types<'a> {
 
 #[derive(Default, Debug, Clone)]
 pub struct Config {
+    // TODO: Make this optional, use spec constants
     pub local_size: [u32; 3],
     // TODO: Fill this in Default::default() instead of using an option
     pub version: Option<(u8, u8)>,

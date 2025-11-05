@@ -23,9 +23,7 @@ use vulkano::memory::allocator::{
     StandardMemoryAllocator,
 };
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::{
-    IntoPipelineLayoutCreateInfoError, PipelineDescriptorSetLayoutCreateInfo,
-};
+use vulkano::pipeline::layout:: PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
@@ -58,29 +56,26 @@ pub enum CreateError {
     EntryPointMainMissing,
     NoPhysicalDevice,
     DeviceQueueLacksCompute,
-    VulkanLoading(vulkano::LoadingError),
-    Vulkan(vulkano::VulkanError),
-    VulkanValidation(Box<vulkano::ValidationError>),
-    VulkanPipelineLayout(IntoPipelineLayoutCreateInfoError),
+    LibraryLoading(vulkano::LoadingError),
+    InstanceCreation(vulkano::Validated<vulkano::VulkanError>),
+    EnumeratePhysicalDevices(vulkano::VulkanError),
+    CreateDevice(vulkano::Validated<vulkano::VulkanError>),
 }
 
 #[derive(Debug, Clone)]
 pub enum MakeBufferError {
     InvalidLayout,
-    VulkanAllocateBuffer(vulkano::buffer::AllocateBufferError),
-    VulkanValidation(Box<vulkano::ValidationError>),
+    Allocate(vulkano::Validated<vulkano::buffer::AllocateBufferError>),
 }
 
 #[derive(Debug)]
 pub enum MakePipelineError {
-    Vulkan(vulkano::VulkanError),
-    VulkanValidation(Box<vulkano::ValidationError>),
-    VulkanPipelineLayout(IntoPipelineLayoutCreateInfoError),
+    PipelineCreation(vulkano::Validated<VulkanError>),
 }
 
 impl Context {
     pub fn new(config: Config) -> Result<Self, CreateError> {
-        let library = VulkanLibrary::new()?;
+        let library = VulkanLibrary::new().map_err(CreateError::LibraryLoading)?;
         let instance = Instance::new(
             library.clone(),
             InstanceCreateInfo {
@@ -91,10 +86,11 @@ impl Context {
                     .unwrap_or(Version::major_minor(0, 0)),
                 ..Default::default()
             },
-        )?;
+        ).map_err(CreateError::InstanceCreation)?;
 
         let (physical_device, queue_family_index) = instance
-            .enumerate_physical_devices()?
+            .enumerate_physical_devices()
+            .map_err(CreateError::EnumeratePhysicalDevices)?
             .filter_map(|d| {
                 rate_physical_device(&d).map(|(score, queue_family_index)| {
                     (d, score, queue_family_index)
@@ -113,7 +109,7 @@ impl Context {
                 }],
                 ..Default::default()
             },
-        )?;
+        ).map_err(CreateError::CreateDevice)?;
 
         let queue = queues
             .next()
@@ -166,7 +162,7 @@ impl Context {
             },
             DeviceLayout::from_layout(layout)
                 .ok_or_else(|| MakeBufferError::InvalidLayout)?,
-        )?)
+        ).map_err(MakeBufferError::Allocate)?)
     }
 
     pub fn make_pipeline_layout<'a>(
@@ -191,7 +187,7 @@ impl Context {
             self.device.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )?)
+        ).map_err(MakePipelineError::PipelineCreation)?)
     }
 
     pub fn make_descriptor_set(
@@ -301,87 +297,5 @@ fn rate_device_type(
         Cpu => 100,
         Other => 0,
         _ => unreachable!(),
-    }
-}
-
-impl From<vulkano::LoadingError> for CreateError {
-    fn from(err: vulkano::LoadingError) -> Self {
-        CreateError::VulkanLoading(err)
-    }
-}
-
-impl From<vulkano::VulkanError> for CreateError {
-    fn from(err: vulkano::VulkanError) -> Self {
-        CreateError::Vulkan(err)
-    }
-}
-
-impl From<Box<vulkano::ValidationError>> for CreateError {
-    fn from(err: Box<vulkano::ValidationError>) -> Self {
-        CreateError::VulkanValidation(err)
-    }
-}
-
-impl<T: Into<CreateError>> From<vulkano::Validated<T>> for CreateError {
-    fn from(err: vulkano::Validated<T>) -> Self {
-        match err {
-            vulkano::Validated::Error(err) => err.into(),
-            vulkano::Validated::ValidationError(err) => err.into(),
-        }
-    }
-}
-
-impl From<IntoPipelineLayoutCreateInfoError> for CreateError {
-    fn from(err: IntoPipelineLayoutCreateInfoError) -> Self {
-        CreateError::VulkanPipelineLayout(err)
-    }
-}
-
-impl From<vulkano::buffer::AllocateBufferError> for MakeBufferError {
-    fn from(err: vulkano::buffer::AllocateBufferError) -> Self {
-        MakeBufferError::VulkanAllocateBuffer(err)
-    }
-}
-
-impl From<Box<vulkano::ValidationError>> for MakeBufferError {
-    fn from(err: Box<vulkano::ValidationError>) -> Self {
-        MakeBufferError::VulkanValidation(err)
-    }
-}
-
-impl<T: Into<MakeBufferError>> From<vulkano::Validated<T>> for MakeBufferError {
-    fn from(err: vulkano::Validated<T>) -> Self {
-        match err {
-            vulkano::Validated::Error(err) => err.into(),
-            vulkano::Validated::ValidationError(err) => err.into(),
-        }
-    }
-}
-
-impl From<vulkano::VulkanError> for MakePipelineError {
-    fn from(err: vulkano::VulkanError) -> Self {
-        MakePipelineError::Vulkan(err)
-    }
-}
-impl From<Box<vulkano::ValidationError>> for MakePipelineError {
-    fn from(err: Box<vulkano::ValidationError>) -> Self {
-        MakePipelineError::VulkanValidation(err)
-    }
-}
-
-impl<T: Into<MakePipelineError>> From<vulkano::Validated<T>>
-    for MakePipelineError
-{
-    fn from(err: vulkano::Validated<T>) -> Self {
-        match err {
-            vulkano::Validated::Error(err) => err.into(),
-            vulkano::Validated::ValidationError(err) => err.into(),
-        }
-    }
-}
-
-impl From<IntoPipelineLayoutCreateInfoError> for MakePipelineError {
-    fn from(err: IntoPipelineLayoutCreateInfoError) -> Self {
-        MakePipelineError::VulkanPipelineLayout(err)
     }
 }

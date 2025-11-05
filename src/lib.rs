@@ -2,6 +2,7 @@
 // use vulkano::VulkanLibrary;
 // use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
+// https://www.youtube.com/watch?v=PN0kkLUGfSM
 #![feature(array_try_map)]
 
 pub mod protos;
